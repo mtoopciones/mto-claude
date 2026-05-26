@@ -70,9 +70,11 @@ async def on_connected(ib: IB) -> None:
     if daily_reporter:
         daily_reporter.ib = ib
 
-    # Cargar posiciones actuales — forzar reqPositions para vaciar caché vacía
-    ib.reqPositions()          # solicita actualización a IB
-    await asyncio.sleep(2)     # espera a que lleguen los datos
+    # Cargar posiciones actuales (reqPositionsAsync para no bloquear el event loop)
+    try:
+        await asyncio.wait_for(ib.reqPositionsAsync(), timeout=10)
+    except asyncio.TimeoutError:
+        logger.warning("reqPositions timeout — positions cache may be empty")
     await position_tracker.load_from_ib(ib)
 
     # Recuperar fills recientes antes de registrar el handler (evita duplicados)
