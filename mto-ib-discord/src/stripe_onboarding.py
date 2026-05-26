@@ -113,8 +113,10 @@ class StripeOnboarding:
             logger.error(f"Webhook error de firma: {e}")
             return web.Response(status=400, text=str(e))
 
-        if event.get("type") == "customer.created":
-            customer = event["data"]["object"]
+        event_type = event.type if hasattr(event, "type") else event.get("type")
+        customer_obj = event.data.object if hasattr(event, "data") else event["data"]["object"]
+        if event_type == "customer.created":
+            customer = customer_obj
             asyncio.ensure_future(self._handle_new_customer(customer))
 
         return web.Response(status=200, text="ok")
