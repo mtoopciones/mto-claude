@@ -592,7 +592,7 @@ class DiscordApprover:
         await self._handle_youtube_message(message)
 
     async def _handle_youtube_message(self, message: discord.Message) -> None:
-        from .youtube_processor import extract_video_id, get_transcript, generate_summary, build_embed
+        from .youtube_processor import extract_video_id, get_content, generate_summary, build_embed
 
         video_id = extract_video_id(message.content)
         if not video_id:
@@ -606,13 +606,13 @@ class DiscordApprover:
         except Exception:
             pass
 
-        transcript = await get_transcript(video_id)
-        if not transcript:
+        content, source = await get_content(video_id)
+        if not content:
             try:
                 await message.remove_reaction("⏳", self.client.user)
                 await message.reply(
-                    "❌ No se pudo obtener el transcript de este video. "
-                    "El video puede no tener subtítulos disponibles."
+                    "❌ No se pudo obtener información de este video. "
+                    "Puede ser privado, restringido por edad, o no tener subtítulos ni descripción."
                 )
             except Exception:
                 pass
@@ -627,8 +627,8 @@ class DiscordApprover:
             return
 
         try:
-            summary = await generate_summary(transcript, video_url, self.anthropic_key)
-            embed = build_embed(summary, video_url)
+            summary = await generate_summary(content, source, video_url, self.anthropic_key)
+            embed = build_embed(summary, video_url, source)
 
             try:
                 await message.remove_reaction("⏳", self.client.user)
