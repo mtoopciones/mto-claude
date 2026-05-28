@@ -116,7 +116,7 @@ def _vtt_to_text(vtt: str) -> str:
 
 
 async def _get_metadata_ytdlp(video_id: str) -> Optional[str]:
-    """Obtiene título + descripción del video como fallback."""
+    """Obtiene título + descripción del video via yt-dlp."""
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
         loop = asyncio.get_event_loop()
@@ -127,14 +127,80 @@ async def _get_metadata_ytdlp(video_id: str) -> Optional[str]:
         if not stdout.strip():
             return None
         data = json.loads(stdout)
-        title = data.get("title", "")
-        desc  = (data.get("description", "") or "")[:2000]
+        title   = data.get("title", "")
+        desc    = (data.get("description", "") or "")[:2000]
         channel = data.get("channel", "")
-        result = f"TÍTULO: {title}\nCANAL: {channel}\nDESCRIPCIÓN:\n{desc}"
-        logger.info(f"YouTubeProcessor: usando metadatos ({title[:60]})")
+        result  = f"TÍTULO: {title}\nCANAL: {channel}\nDESCRIPCIÓN:\n{desc}"
+        logger.info(f"YouTubeProcessor: metadatos yt-dlp ({title[:60]})")
         return result
     except Exception as e:
         logger.debug(f"YouTubeProcessor: metadata yt-dlp falló — {e}")
+    return None
+
+
+async def _get_metadata_web(video_id: str) -> Optional[str]:
+    """
+    Fallback final: oEmbed (siempre público) + scraping de la página.
+    Funciona incluso cuando YouTube bloquea yt-dlp por IP de datacenter.
+    """
+    import aiohttp
+
+    title = ""
+    author = ""
+    description = ""
+
+    video_url  = f"https://www.youtube.com/watch?v={video_id}"
+    oembed_url = f"https://www.youtube.com/oembed?url={video_url}&format=json"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # 1. oEmbed — siempre funciona, da título y autor
+            try:
+                async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data   = await resp.json(content_type=None)
+                        title  = data.get("title", "")
+                        author = data.get("author_name", "")
+                        logger.info(f"YouTubeProcessor: oEmbed OK — {title[:60]}")
+            except Exception as e:
+                logger.debug(f"YouTubeProcessor: oEmbed falló — {e}")
+
+            # 2. Página HTML — extrae descripción del JSON-LD
+            try:
+                async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="replace")
+                        # JSON-LD en la página
+                        m = re.search(
+                            r'<script type="application/ld\+json">(.*?)</script>',
+                            html, re.DOTALL
+                        )
+                        if m:
+                            ld = json.loads(m.group(1))
+                            description = (ld.get("description", "") or "")[:2000]
+                        # Fallback: meta description
+                        if not description:
+                            m2 = re.search(r'<meta name="description" content="([^"]*)"', html)
+                            if m2:
+                                description = m2.group(1)[:500]
+            except Exception as e:
+                logger.debug(f"YouTubeProcessor: page scrape falló — {e}")
+
+        if title:
+            result = f"TÍTULO: {title}\nCANAL: {author}\nDESCRIPCIÓN:\n{description}"
+            logger.info(f"YouTubeProcessor: metadatos web OK — {title[:60]}")
+            return result
+    except Exception as e:
+        logger.debug(f"YouTubeProcessor: _get_metadata_web falló — {e}")
     return None
 
 
@@ -154,6 +220,10 @@ async def get_content(video_id: str) -> Tuple[Optional[str], str]:
         return text, "captions"
 
     text = await _get_metadata_ytdlp(video_id)
+    if text:
+        return text, "metadata"
+
+    text = await _get_metadata_web(video_id)
     if text:
         return text, "metadata"
 
