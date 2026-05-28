@@ -25,6 +25,7 @@ class TradeMetrics:
     close_cost: Optional[float] = None
     trade_result: Optional[float] = None
     realized_pnl: Optional[float] = None   # PNL real reportado por IB
+    open_premium_net: Optional[float] = None  # Prima neta al abrir (para tarjeta de cierre)
 
 
 def calculate(strategy: StrategyInfo, open_premium: Optional[float] = None) -> TradeMetrics:
@@ -69,10 +70,12 @@ def calculate(strategy: StrategyInfo, open_premium: Optional[float] = None) -> T
     close_cost: Optional[float] = None
     trade_result: Optional[float] = None
     realized_pnl_total: Optional[float] = None
+    open_prem_net: Optional[float] = None   # prima neta al abrir
 
     if open_premium is not None:
         close_cost = -net_premium
         trade_result = open_premium + net_premium
+        open_prem_net = open_premium
 
     # Si alguna pata trae realizedPNL de IB, lo usamos directamente
     pnl_from_ib = sum(l.realized_pnl for l in legs)
@@ -98,6 +101,7 @@ def calculate(strategy: StrategyInfo, open_premium: Optional[float] = None) -> T
         close_cost=round(close_cost, 2) if close_cost is not None else None,
         trade_result=round(trade_result, 2) if trade_result is not None else None,
         realized_pnl=realized_pnl_total,
+        open_premium_net=round(open_prem_net, 2) if open_prem_net is not None else None,
     )
 
 
@@ -160,7 +164,9 @@ def _calc_max(strategy: StrategyInfo, gross_premium: float):
         strike = min(strikes) if strikes else 0
         max_gain = gross_premium
         max_loss = -(strike * 100 - gross_premium)
-        buying_power = -(strike * 100 * 0.20)
+        # CSP = Cash Secured Put: el capital comprometido es el efectivo necesario
+        # para comprar las acciones si se ejerce = strike×100 − prima cobrada.
+        buying_power = max_loss
         return max_gain, max_loss, buying_power
 
     if short == "SC":
@@ -169,6 +175,26 @@ def _calc_max(strategy: StrategyInfo, gross_premium: float):
         buying_power = -gross_premium * 5
         return max_gain, max_loss, buying_power
 
+    # ── Estrategia genérica con componente de spread de puts ──────
+    # Ejemplo: 3L = SELL PUT $60 / BUY PUT $35 / BUY CALL $100
+    # El riesgo real no es la prima pagada sino el ancho del spread de puts
+    # más la prima neta de débito:
+    #   riesgo = (sell_put_strike − buy_put_strike) × 100 + |neto_debit|
+    sell_puts = [l for l in puts if l.action == "SELL" and l.strike]
+    buy_puts  = [l for l in puts if l.action == "BUY"  and l.strike]
+    if sell_puts and buy_puts:
+        sell_strike = max(l.strike for l in sell_puts)
+        buy_strike  = max(l.strike for l in buy_puts)
+        if sell_strike > buy_strike:
+            spread_w  = (sell_strike - buy_strike) * 100
+            net_debit = max(0.0, -gross_premium)   # solo suma si es débito
+            max_loss  = -(spread_w + net_debit)
+            # Si hay calls largas el upside es ilimitado; si no, = prima cobrada
+            long_calls = [l for l in calls if l.action == "BUY"]
+            max_gain   = float("inf") if long_calls else max(gross_premium, 0)
+            return max_gain, max_loss, max_loss
+
+    # ── Fallback completamente genérico ───────────────────────────
     max_gain = gross_premium if gross_premium > 0 else float("inf")
     max_loss = gross_premium if gross_premium < 0 else float("-inf")
     return max_gain, max_loss, -abs(gross_premium)

@@ -4,6 +4,7 @@ Conecta IB Gateway, escucha fills, detecta estrategias y publica en Discord.
 """
 
 import asyncio
+import json
 import sys
 import os
 from datetime import datetime, timedelta
@@ -32,6 +33,7 @@ from .facebook_poster import build_from_config as _build_facebook
 from .instagram_poster import build_from_config as _build_instagram
 from .twitter_poster import build_from_config as _build_twitter
 from .health_reporter import HealthReporter
+from .discord_approver import DiscordApprover
 
 
 # ─────────────────────────────────────────────────────────────
@@ -56,6 +58,36 @@ twitter_poster = None
 ROLL_WINDOW = 60  # segundos para detectar roll
 _pending_close: Dict[tuple, dict] = {}  # {(account, symbol, right): {...}}
 _seen_exec_ids: set = set()            # IDs ya procesados (evita duplicados en polling)
+
+# Primas de apertura por posición — persisten entre reinicios para mostrar en tarjeta de cierre
+_open_premiums: Dict[str, float] = {}
+_OPEN_PREMIUMS_FILE = "data/open_premiums.json"
+
+
+def _premium_key(account: str, symbol: str, right: str,
+                 strike: float, expiry: str) -> str:
+    """Clave única por posición para guardar/recuperar la prima de apertura."""
+    return f"{account}|{symbol.upper()}|{(right or '').upper()}|{strike or 0}|{expiry or ''}"
+
+
+def _load_open_premiums() -> None:
+    global _open_premiums
+    try:
+        if os.path.exists(_OPEN_PREMIUMS_FILE):
+            with open(_OPEN_PREMIUMS_FILE, "r", encoding="utf-8") as f:
+                _open_premiums = json.load(f)
+    except Exception as e:
+        logger.warning(f"No se pudo cargar open_premiums: {e}")
+        _open_premiums = {}
+
+
+def _save_open_premiums() -> None:
+    try:
+        os.makedirs(os.path.dirname(_OPEN_PREMIUMS_FILE), exist_ok=True)
+        with open(_OPEN_PREMIUMS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_open_premiums, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar open_premiums: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -113,29 +145,42 @@ async def _recover_recent_fills(ib: IB) -> None:
     Al arrancar/reconectar:
     - Fills de los últimos 30 min → se publican en Discord (y se registran en daily reporter)
     - Fills del resto del día de hoy → solo se registran en daily reporter (sin Discord)
-    Esto garantiza que el reporte post-mercado siempre tenga el día completo,
-    aunque el bot se haya reiniciado varias veces.
+
+    Lógica de detección correcta de APERTURA/CIERRE:
+    ─────────────────────────────────────────────────
+    El tracker se carga con el estado ACTUAL de IB (ya incluye todos los fills de hoy).
+    Si procesamos los fills directamente, 'prev' sería el estado post-fill → todos
+    parecerían APERTURAs nuevas cuando en realidad pueden ser CIERREs.
+
+    Solución:
+      1. Revertir todos los fills de hoy en el tracker → estado inicio del día
+      2. Reproducir todos los fills en orden cronológico → detección correcta
+
+    Además, esperamos unos segundos tras reqExecutionsAsync para que lleguen los
+    CommissionReport (IB los envía de forma asíncrona justo después de las ejecuciones).
     """
     from zoneinfo import ZoneInfo as _ZI
-    from datetime import time as _time, date as _date
+    from datetime import time as _time
 
     try:
         logger.info("Consultando fills del día...")
         fills: List[Fill] = await ib.reqExecutionsAsync(ExecutionFilter())
 
-        now          = datetime.now()
-        cutoff_30m   = now - timedelta(minutes=30)
+        # Esperar que IB envíe los CommissionReport (llegan ms después del fill)
+        await asyncio.sleep(2.0)
+
+        now        = datetime.now()
+        cutoff_30m = now - timedelta(minutes=30)
 
         # Inicio del día de trading en hora ET (medianoche ET → UTC naive)
-        _ET = _ZI("America/New_York")
-        today_et     = datetime.now(_ET).date()
-        day_start    = (
+        _ET      = _ZI("America/New_York")
+        today_et = datetime.now(_ET).date()
+        day_start = (
             datetime.combine(today_et, _time(0, 0), tzinfo=_ET)
             .astimezone(_ZI("UTC"))
             .replace(tzinfo=None)
         )
 
-        # Filtrar solo fills de hoy
         today_fills = [
             f for f in fills
             if f.time and f.time.replace(tzinfo=None) >= day_start
@@ -157,6 +202,30 @@ async def _recover_recent_fills(ib: IB) -> None:
 
         sorted_orders = sorted(orders.values(), key=_order_time)
 
+        # ── Paso 1: revertir todos los fills de hoy ───────────────────────────
+        # El tracker tiene estado ACTUAL (post-fills). Necesitamos estado
+        # INICIO DEL DÍA para que la detección APERTURA/CIERRE sea correcta.
+        for order_fills in reversed(sorted_orders):
+            for f in order_fills:
+                c  = f.contract
+                ex = f.execution
+                if not c or not ex:
+                    continue
+                action = "BUY" if ex.side == "BOT" else "SELL"
+                qty    = abs(ex.shares or 0)
+                delta  = qty if action == "BUY" else -qty
+                right  = getattr(c, "right",  "") or ""
+                strike = float(getattr(c, "strike", 0.0) or 0.0)
+                expiry = getattr(c, "lastTradeDateOrContractMonth", "") or ""
+                prev   = position_tracker.get_position(
+                    ex.acctNumber, c.symbol, c.secType, right, strike, expiry)
+                position_tracker.update(
+                    account=ex.acctNumber, symbol=c.symbol, sec_type=c.secType,
+                    right=right, strike=strike, expiry=expiry,
+                    new_qty=prev - delta,   # deshacer el fill
+                )
+
+        # ── Paso 2: reproducir fills en orden cronológico ─────────────────────
         recent_count  = 0
         history_count = 0
 
@@ -164,19 +233,20 @@ async def _recover_recent_fills(ib: IB) -> None:
             legs = _fills_to_legs(order_fills)
             if not legs:
                 continue
-            t = order_fills[0].time
+            t        = order_fills[0].time
             order_dt = t.replace(tzinfo=None) if t else datetime.min
 
             if order_dt > cutoff_30m:
-                # Reciente: publicar en Discord (también registra en daily reporter)
+                # Reciente: publicar en Discord (process_order actualiza posición)
                 await process_order(legs)
                 recent_count += 1
             else:
-                # Histórico de hoy: solo registrar en daily reporter
+                # Histórico: solo registrar en daily reporter y actualizar posición
                 await _record_in_reporter(legs)
+                _update_position_from_legs(legs)   # necesario para fills siguientes
                 history_count += 1
 
-            # Marcar todos los execIds de esta orden como procesados
+            # Marcar todos los execIds como procesados
             for f in order_fills:
                 if f.execution and f.execution.execId:
                     _seen_exec_ids.add(f.execution.execId)
@@ -200,13 +270,71 @@ async def _record_in_reporter(legs: List[Leg]) -> None:
     try:
         strategy = classify(legs)
         metrics  = calc_metrics(strategy)
-        # Heurística: prima neta positiva = apertura/roll, negativa = cierre
-        prem = metrics.net_premium_after_comm or 0.0
-        event_type = TradeEvent.OPEN if prem >= 0 else TradeEvent.CLOSE
+        # Usar el tracker de posiciones (igual que process_order) en lugar de una
+        # heurística por signo de prima.  Los spreads de débito (LPS, LCS…) generan
+        # prima NEGATIVA en apertura → la heurística los clasificaría como CIERRE,
+        # produciendo una clave de dedup diferente a la guardada por process_order
+        # y añadiendo duplicados en cada reinicio del bot.
+        primary_leg  = _pick_primary_leg(legs)
+        signed_delta = (
+            -primary_leg.quantity if primary_leg.action == "SELL" else primary_leg.quantity
+        )
+        event_type = position_tracker.determine_trade_event(
+            account  = primary_leg.account,
+            symbol   = primary_leg.symbol,
+            sec_type = primary_leg.sec_type,
+            right    = primary_leg.right,
+            strike   = primary_leg.strike,
+            expiry   = primary_leg.expiry,
+            delta    = signed_delta,
+        )
         daily_reporter.record_trade(event_type, strategy, metrics, account_info["name"])
         logger.debug(f"  → Daily reporter (histórico): {event_type} {strategy.short_name} {strategy.underlying}")
     except Exception as e:
         logger.error(f"Error registrando orden histórica en daily reporter: {e}")
+
+
+def _pick_primary_leg(legs: List[Leg]) -> "Leg":
+    """
+    Elige la pata principal para el tracker de posiciones.
+
+    Preferencia:
+    1. Primera pata cuya clave ya existe en el tracker (cierre de spread,
+       e.g. cerrar un BCS con un CCS: la pata con posición existente es BUY $300,
+       no la nueva SELL $200).
+    2. Si ninguna tiene posición existente (apertura nueva): primera SELL encontrada,
+       o en su defecto la primera pata.
+    """
+    for leg in legs:
+        if position_tracker.get_position(
+            leg.account, leg.symbol, leg.sec_type,
+            leg.right or "", leg.strike or 0.0, leg.expiry or ""
+        ) != 0.0:
+            return leg
+    return next((l for l in legs if l.action == "SELL"), legs[0])
+
+
+def _update_position_from_legs(legs: List[Leg]) -> None:
+    """
+    Actualiza el tracker de posiciones para fills históricos (sin publicar en Discord).
+    Necesario en _recover_recent_fills para que los fills posteriores detecten
+    correctamente si son APERTURA o CIERRE.
+    """
+    if not legs:
+        return
+    primary_leg  = _pick_primary_leg(legs)
+    signed_delta = (-primary_leg.quantity if primary_leg.action == "SELL"
+                    else primary_leg.quantity)
+    new_qty = _calc_new_position(primary_leg, signed_delta)
+    position_tracker.update(
+        account  = primary_leg.account,
+        symbol   = primary_leg.symbol,
+        sec_type = primary_leg.sec_type,
+        right    = primary_leg.right,
+        strike   = primary_leg.strike,
+        expiry   = primary_leg.expiry,
+        new_qty  = new_qty,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -295,8 +423,8 @@ async def process_order(legs: List[Leg]) -> None:
     # Clasificar estrategia
     strategy: StrategyInfo = classify(legs)
 
-    # Pata principal para el tracker (primera vendida, o primera si no hay)
-    primary_leg = next((l for l in legs if l.action == "SELL"), legs[0])
+    # Pata principal para el tracker (pata con posición existente, o primera SELL/primera)
+    primary_leg = _pick_primary_leg(legs)
 
     # SC → CC: en España no se pueden abrir Naked Calls.
     # Si hay ≥100 acciones del subyacente en cartera, es una Covered Call.
@@ -347,8 +475,27 @@ async def process_order(legs: List[Leg]) -> None:
         new_qty=new_qty,
     )
 
-    # Calcular métricas
-    metrics = calc_metrics(strategy)
+    # Calcular métricas (para cierres: usar la prima de apertura almacenada)
+    prem_key = _premium_key(
+        primary_leg.account,
+        primary_leg.symbol,
+        primary_leg.right or "",
+        primary_leg.strike or 0.0,
+        primary_leg.expiry or "",
+    )
+    open_prem: Optional[float] = None
+    if event_type == TradeEvent.CLOSE:
+        open_prem = _open_premiums.pop(prem_key, None)
+        _save_open_premiums()
+    elif event_type == TradeEvent.PARTIAL_CLOSE:
+        open_prem = _open_premiums.get(prem_key)  # no borrar, posición sigue abierta
+
+    metrics = calc_metrics(strategy, open_premium=open_prem)
+
+    # En aperturas/incrementos: guardar la prima neta para mostrarla en el futuro cierre
+    if event_type in (TradeEvent.OPEN, TradeEvent.ADD):
+        _open_premiums[prem_key] = metrics.net_premium_after_comm
+        _save_open_premiums()
 
     # ── Lógica de roll ────────────────────────────────────────
     # Un roll es: CLOSE + OPEN del mismo subyacente, mismo tipo de opción
@@ -709,6 +856,7 @@ async def main_async() -> None:
     cfg         = cfg_module.load("config.yaml")
     account_map = cfg_module.account_map(cfg)
     setup_logging(cfg.get("logging", {}))
+    _load_open_premiums()
 
     logger.info("=" * 50)
     logger.info("MTO IB → Discord  |  Iniciando sistema")
@@ -808,6 +956,22 @@ async def main_async() -> None:
             log_channel=log_channel,
         )
         await weekly_analyst.start()
+
+    # ── Discord Approver (revisión de informes con botones) ──────
+    approver = None
+    if cfg.get("discord", {}).get("bot_token") and cfg.get("discord", {}).get("review_webhook"):
+        approver = DiscordApprover(
+            cfg=cfg,
+            facebook_poster=facebook_poster,
+            instagram_poster=instagram_poster,
+            twitter_poster=twitter_poster,
+        )
+        await approver.start()
+        # Conectar a reportes
+        if daily_reporter:
+            daily_reporter.approver = approver
+        if weekly_analyst:
+            weekly_analyst.approver = approver
 
     # ── Stripe onboarding ────────────────────────────────────────
     if cfg.get("stripe", {}).get("api_key"):

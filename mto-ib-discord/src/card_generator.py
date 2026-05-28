@@ -328,13 +328,17 @@ def _draw_card(strategy: StrategyInfo, metrics: TradeMetrics,
             ("%", IC_DEEP,   "ROI estimado",               _fpct(metrics.roi_pct),                 PILL_BLUE),
         ]
     else:
-        # close_prem_gross = prima bruta pagada/cobrada (sin comisión)
-        # Para cierres de crédito (recibimos prima): net_premium > 0
-        # Para cierres de débito (pagamos prima):    net_premium < 0
-        _is_close_credit = (metrics.net_premium or 0) >= 0
-        _prima_label = "Prima recibida" if _is_close_credit else "Prima pagada"
-        _prima_value = _fmoney(abs(metrics.net_premium or 0))
-        _prima_pill  = PILL_GREEN if _is_close_credit else PILL_RED
+        # Primera fila: prima neta al abrir (si disponible) o prima del cierre actual
+        if metrics.open_premium_net is not None:
+            _prima_label = "Prima apertura neta"
+            _prima_value = _fmoney(metrics.open_premium_net)
+            _prima_pill  = PILL_GREEN if metrics.open_premium_net >= 0 else PILL_RED
+        else:
+            # Fallback si no tenemos la prima de apertura guardada
+            _is_close_credit = (metrics.net_premium or 0) >= 0
+            _prima_label = "Prima recibida" if _is_close_credit else "Prima pagada"
+            _prima_value = _fmoney(abs(metrics.net_premium or 0))
+            _prima_pill  = PILL_GREEN if _is_close_credit else PILL_RED
 
         fin_rows = [
             ("P", IC_PURPLE, _prima_label,         _prima_value,                              _prima_pill),

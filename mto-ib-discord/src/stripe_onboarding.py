@@ -122,9 +122,10 @@ class StripeOnboarding:
         return web.Response(status=200, text="ok")
 
     async def _handle_new_customer(self, customer: dict) -> None:
-        email       = (customer.get("email") or "").strip()
-        name        = (customer.get("name")  or email.split("@")[0]).strip()
-        customer_id = customer.get("id", "")
+        _get = lambda obj, key, default="": obj.get(key, default) if hasattr(obj, "get") else getattr(obj, key, default) or default
+        email       = (_get(customer, "email") or "").strip()
+        name        = (_get(customer, "name")  or email.split("@")[0]).strip()
+        customer_id = _get(customer, "id")
 
         if not email:
             logger.warning(f"Nuevo cliente Stripe sin email: {customer_id}")

@@ -6,6 +6,8 @@ Solo días laborables (lunes–viernes).
 """
 
 import asyncio
+import json
+import os
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional
 from xml.etree import ElementTree as ET
@@ -53,6 +55,8 @@ _BROWSER_HEADERS = {
 
 
 class DailyReporter:
+    _STATE_FILE = "data/daily_reporter_state.json"
+
     def __init__(self, webhook_url: str):
         self.webhook_url        = webhook_url
         self.log_channel        = None   # asignado desde main.py
@@ -67,14 +71,76 @@ class DailyReporter:
         self.instagram_poster        = None   # asignado desde main.py
         self.twitter_poster          = None   # asignado desde main.py
         self.social_cfg              = {}     # cfg completo para leer flags
+        self.ib                      = None   # referencia IB (asignado desde main.py al conectar)
+        self.approver                = None   # asignado desde main.py si está activo
         self._reset_day()
+        self._load_state()   # restaurar operaciones del día si el bot se reinició
+
+    # ── Persistencia de estado (sobrevive reinicios del bot) ─────
+
+    def _save_state(self) -> None:
+        """Guarda las operaciones del día en disco tras cada registro."""
+        try:
+            os.makedirs(os.path.dirname(self._STATE_FILE), exist_ok=True)
+            state = {
+                "date":            date.today().isoformat(),
+                "opens":           self._opens,
+                "rolls":           self._rolls,
+                "closes":          self._closes,
+                "prem_collected":  self._prem_collected,
+                "prem_paid":       self._prem_paid,
+                "pnl_closed":      self._pnl_closed,
+            }
+            with open(self._STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Daily reporter: no se pudo guardar estado: {e}")
+
+    def _load_state(self) -> None:
+        """Al arrancar, restaura las operaciones del día si el estado guardado es de hoy."""
+        try:
+            if not os.path.exists(self._STATE_FILE):
+                return
+            with open(self._STATE_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("date") != date.today().isoformat():
+                logger.debug("Daily reporter: estado guardado es de otro día, ignorando")
+                return
+            self._opens           = state.get("opens",  [])
+            self._rolls           = state.get("rolls",  [])
+            self._closes          = state.get("closes", [])
+            self._prem_collected  = float(state.get("prem_collected", 0.0))
+            self._prem_paid       = float(state.get("prem_paid",      0.0))
+            self._pnl_closed      = float(state.get("pnl_closed",     0.0))
+            # Poblar el set de claves ya registradas para evitar duplicados en recovery
+            for e in self._opens:
+                self._seen_keys.add((e["symbol"], e["account"], "open"))
+            for e in self._closes:
+                self._seen_keys.add((e["symbol"], e["account"], "close"))
+            for e in self._rolls:
+                self._seen_keys.add((e["symbol"], e["account"], "roll"))
+            total = len(self._opens) + len(self._rolls) + len(self._closes)
+            logger.info(
+                f"Daily reporter: {total} operación(es) restauradas desde disco "
+                f"({len(self._opens)} aperturas, {len(self._closes)} cierres, {len(self._rolls)} rolls)"
+            )
+        except Exception as e:
+            logger.warning(f"Daily reporter: no se pudo cargar estado: {e}")
 
     # ── Registro de operaciones del día ───────────────────────
 
     def record_trade(self, event_type: str, strategy, metrics, account_name: str) -> None:
-        prem   = metrics.net_premium_after_comm or 0.0
-        entry  = {"symbol": strategy.underlying, "account": account_name}
+        prem      = metrics.net_premium_after_comm or 0.0
+        ev_simple = "open" if event_type in (TradeEvent.OPEN, TradeEvent.ADD) else "close"
+        key       = (strategy.underlying, account_name, ev_simple)
 
+        # Evitar duplicados cuando la recovery de IB re-añade ops ya en el estado de disco
+        if key in self._seen_keys:
+            logger.debug(f"Daily reporter: {strategy.underlying} ({account_name}) ya registrado, ignorando duplicado")
+            return
+        self._seen_keys.add(key)
+
+        entry = {"symbol": strategy.underlying, "account": account_name, "date": date.today().isoformat()}
         if event_type in (TradeEvent.OPEN, TradeEvent.ADD):
             self._opens.append(entry)
         elif event_type in (TradeEvent.CLOSE, TradeEvent.PARTIAL_CLOSE):
@@ -83,12 +149,19 @@ class DailyReporter:
 
         self._prem_collected += max(prem, 0.0)
         self._prem_paid      += max(-prem, 0.0)
+        self._save_state()
 
     def record_roll(self, open_strategy, open_metrics, account_name: str) -> None:
         prem = open_metrics.net_premium_after_comm or 0.0
-        self._rolls.append({"symbol": open_strategy.underlying, "account": account_name})
+        key  = (open_strategy.underlying, account_name, "roll")
+        if key in self._seen_keys:
+            logger.debug(f"Daily reporter: roll {open_strategy.underlying} ({account_name}) ya registrado, ignorando duplicado")
+            return
+        self._seen_keys.add(key)
+        self._rolls.append({"symbol": open_strategy.underlying, "account": account_name, "date": date.today().isoformat()})
         self._prem_collected += max(prem, 0.0)
         self._prem_paid      += max(-prem, 0.0)
+        self._save_state()
 
     # ── Scheduler ─────────────────────────────────────────────
 
@@ -119,18 +192,18 @@ class DailyReporter:
                     # Esperar hasta post-mercado
                     await _sleep_until(datetime.combine(today, POSTMARKET_TIME, tzinfo=ET_ZONE))
                     await self.send_postmarket()
-                    self._reset_day()
+                    self._reset_day(new_day=True)
                     await _sleep_until(datetime.combine(_next_trading_day(today), time(8, 0), tzinfo=ET_ZONE))
 
                 elif now_et < post_dt:
                     await _sleep_until(post_dt)
                     await self.send_postmarket()
-                    self._reset_day()
+                    self._reset_day(new_day=True)
                     await _sleep_until(datetime.combine(_next_trading_day(today), time(8, 0), tzinfo=ET_ZONE))
 
                 else:
                     # Ya pasó todo hoy
-                    self._reset_day()
+                    self._reset_day(new_day=True)
                     await _sleep_until(datetime.combine(_next_trading_day(today), time(8, 0), tzinfo=ET_ZONE))
 
             except asyncio.CancelledError:
@@ -229,13 +302,36 @@ class DailyReporter:
             today  = now_et.date()
             fecha  = _fmt_date_es(today)
 
-            futures, vix, macro_evs, headlines = await asyncio.gather(
-                _fetch_futures(),
-                _fetch_vix(),
-                _fetch_macro_next_days(today, days=3),
-                _fetch_spanish_headlines(),
-                return_exceptions=False,
-            )
+            # Datos de futuros: IB Gateway primero, Yahoo como fallback.
+            # frozen=False → tipo 3 (Delayed streaming): precio pre-market actual -15 min.
+            # No usar tipo 4 aquí: congelaría al cierre de ayer → valor incorrecto.
+            ib_quotes = {}
+            if self.ib and self.ib.isConnected():
+                ib_quotes = await _fetch_ib_quotes(self.ib, frozen=False)
+                if ib_quotes:
+                    logger.info(f"Pre-mercado: datos IB ({list(ib_quotes.keys())})")
+                else:
+                    logger.warning("Pre-mercado: IB no devolvió datos, usando Yahoo")
+
+            if ib_quotes:
+                futures = {
+                    "S&P 500":    ib_quotes.get("S&P 500", {}),
+                    "Nasdaq 100": ib_quotes.get("Nasdaq",  {}),
+                }
+                vix = ib_quotes.get("VIX", {}).get("price", 0.0)
+                macro_evs, headlines = await asyncio.gather(
+                    _fetch_macro_next_days(today, days=3),
+                    _fetch_spanish_headlines(),
+                )
+            else:
+                logger.info("Pre-mercado: usando Yahoo Finance (IB no disponible)")
+                futures, vix, macro_evs, headlines = await asyncio.gather(
+                    _fetch_futures(),
+                    _fetch_vix(),
+                    _fetch_macro_next_days(today, days=3),
+                    _fetch_spanish_headlines(),
+                    return_exceptions=False,
+                )
 
             narrative = _build_premarket_narrative(futures, vix, macro_evs, headlines, today)
 
@@ -246,10 +342,21 @@ class DailyReporter:
                 "footer":      {"text": "Apertura NYSE en ~20 min  ·  09:30 ET"},
             }
             target = self.premarket_webhook or self.webhook_url
-            await _post_webhook(target, {"embeds": [embed]})
-            logger.info("Reporte pre-mercado enviado")
-            if self.log_channel:
-                await self.log_channel.send_info("📰 Reporte pre-mercado publicado correctamente")
+            if self.approver:
+                await self.approver.post_for_review(
+                    embeds=[embed],
+                    report_type="premarket",
+                    publish_webhook=target,
+                    header="📰 **PRE-MERCADO listo para revisión** — elige qué hacer:",
+                )
+                logger.info("Reporte pre-mercado enviado a revisión")
+                if self.log_channel:
+                    await self.log_channel.send_info("📰 Reporte pre-mercado listo para revisión")
+            else:
+                await _post_webhook(target, {"embeds": [embed]})
+                logger.info("Reporte pre-mercado enviado")
+                if self.log_channel:
+                    await self.log_channel.send_info("📰 Reporte pre-mercado publicado correctamente")
         except Exception as e:
             logger.error(f"Error en send_premarket: {e}")
             if self.log_channel:
@@ -260,7 +367,20 @@ class DailyReporter:
     async def send_postmarket(self) -> None:
         try:
             fecha = _fmt_date_es(datetime.now(ET_ZONE).date())
-            mkt   = await _fetch_market_data()
+
+            # Datos de cierre: Yahoo Finance primero (chartPreviousClose → % cambio fiable),
+            # IB como fallback (ticker.close puede ser un cierre antiguo → % incorrecto).
+            mkt = await _fetch_market_data()
+            if mkt:
+                logger.info(f"Post-mercado: datos Yahoo ({list(mkt.keys())})")
+            else:
+                logger.warning("Post-mercado: Yahoo sin datos, intentando IB Gateway")
+                if self.ib and self.ib.isConnected():
+                    mkt = await _fetch_ib_quotes(self.ib, spot_sp500=True, frozen=True)
+                    if mkt:
+                        logger.info(f"Post-mercado: datos IB ({list(mkt.keys())})")
+                    else:
+                        logger.warning("Post-mercado: sin datos de mercado disponibles")
 
             # Bloque mercados (2-3 líneas)
             mkt_lines = []
@@ -272,16 +392,23 @@ class DailyReporter:
                 )
             mkt_text = "\n".join(mkt_lines) or "_Sin datos de mercado_"
 
+            # Filtrar por la fecha de hoy — garantía adicional contra duplicados
+            # acumulados de días anteriores por reinicios del bot
+            today_iso    = date.today().isoformat()
+            opens_today  = [o for o in self._opens  if o.get("date", today_iso) == today_iso]
+            rolls_today  = [r for r in self._rolls  if r.get("date", today_iso) == today_iso]
+            closes_today = [c for c in self._closes if c.get("date", today_iso) == today_iso]
+
             # Bloque operaciones del día
             ops_parts = []
-            if self._opens:
-                rows = "\n".join(f"  **{o['symbol']}**  ·  _{o['account']}_" for o in self._opens)
+            if opens_today:
+                rows = "\n".join(f"  **{o['symbol']}**  ·  _{o['account']}_" for o in opens_today)
                 ops_parts.append(f"🟢  **APERTURAS**\n{rows}")
-            if self._rolls:
-                rows = "\n".join(f"  **{r['symbol']}**  ·  _{r['account']}_" for r in self._rolls)
+            if rolls_today:
+                rows = "\n".join(f"  **{r['symbol']}**  ·  _{r['account']}_" for r in rolls_today)
                 ops_parts.append(f"🔄  **ROLLS**\n{rows}")
-            if self._closes:
-                rows = "\n".join(f"  **{c['symbol']}**  ·  _{c['account']}_" for c in self._closes)
+            if closes_today:
+                rows = "\n".join(f"  **{c['symbol']}**  ·  _{c['account']}_" for c in closes_today)
                 ops_parts.append(f"🔴  **CIERRES**\n{rows}")
             ops_text = "\n\n".join(ops_parts) if ops_parts else "_Sin operaciones hoy_"
 
@@ -310,10 +437,21 @@ class DailyReporter:
                 ],
                 "footer": {"text": "NYSE cerrado  ·  16:00 ET"},
             }
-            await _post_webhook(self.webhook_url, {"embeds": [embed]})
-            logger.info("Reporte post-mercado enviado")
-            if self.log_channel:
-                await self.log_channel.send_info("📊 Reporte post-mercado publicado correctamente")
+            if self.approver:
+                await self.approver.post_for_review(
+                    embeds=[embed],
+                    report_type="postmarket",
+                    publish_webhook=self.premarket_webhook or self.webhook_url,
+                    header="📊 **CIERRE DE MERCADO listo para revisión** — elige qué hacer:",
+                )
+                logger.info("Reporte post-mercado enviado a revisión")
+                if self.log_channel:
+                    await self.log_channel.send_info("📊 Reporte post-mercado listo para revisión")
+            else:
+                await _post_webhook(self.webhook_url, {"embeds": [embed]})
+                logger.info("Reporte post-mercado enviado")
+                if self.log_channel:
+                    await self.log_channel.send_info("📊 Reporte post-mercado publicado correctamente")
         except Exception as e:
             logger.error(f"Error en send_postmarket: {e}")
             if self.log_channel:
@@ -359,13 +497,27 @@ class DailyReporter:
 
     # ── Utilidades internas ────────────────────────────────────
 
-    def _reset_day(self) -> None:
-        self._opens:  List[dict] = []
-        self._rolls:  List[dict] = []
-        self._closes: List[dict] = []
+    def _reset_day(self, new_day: bool = False) -> None:
+        """
+        Reinicia el estado en memoria.
+        new_day=True: también borra el archivo de estado en disco
+                      (solo al hacer la transición real de día en el scheduler).
+        new_day=False: solo limpia memoria (llamada desde __init__ al arrancar).
+        """
+        self._opens:      List[dict] = []
+        self._rolls:      List[dict] = []
+        self._closes:     List[dict] = []
+        self._seen_keys:  set        = set()   # deduplicación de operaciones
         self._prem_collected = 0.0
         self._prem_paid      = 0.0
         self._pnl_closed     = 0.0
+        if new_day:
+            # Borrar estado en disco al cambiar de día
+            try:
+                if os.path.exists(self._STATE_FILE):
+                    os.remove(self._STATE_FILE)
+            except Exception:
+                pass
 
 
 # ── Helpers de módulo ─────────────────────────────────────────
@@ -383,60 +535,106 @@ def _next_trading_day(d: date) -> date:
     return d
 
 
-async def _fetch_one_future(session: aiohttp.ClientSession, name: str, sym: str) -> tuple:
-    timeout = aiohttp.ClientTimeout(total=8)
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-            f"?interval=1d&range=5d"
-        )
-        async with session.get(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return name, None
-            data   = await resp.json()
-            res    = data["chart"]["result"][0]
-            meta   = res["meta"]
-            closes = res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-            closes = [c for c in closes if c is not None]
+async def _yf_quote_async(sym: str, live: bool = False) -> dict:
+    """
+    Fetch directo a la API de Yahoo Finance (chart v8).
 
-            price = float(meta.get("regularMarketPrice", closes[-1] if closes else 0))
-            # Prioridad: regularMarketChangePercent del meta (más fiable, siempre vs previousClose)
-            # Fallback: calcular manualmente con previousClose explícito del meta
-            chg_meta = meta.get("regularMarketChangePercent")
-            if chg_meta is not None:
-                chg = float(chg_meta)
+    live=False (post-mercado, default):
+        Usa el array OHLCV diario (última vela completa) para el cierre OFICIAL
+        de la sesión regular. Más preciso que regularMarketPrice.
+
+    live=True (pre-mercado, futuros en tiempo real):
+        Usa regularMarketPrice (precio actual de mercado) vs chartPreviousClose
+        (cierre de ayer). Correcto para futuros que cotizan casi 24h.
+    """
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        f"?interval=1d&range=5d"
+    )
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(headers=_BROWSER_HEADERS, timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.debug(f"Yahoo API {sym}: HTTP {resp.status}")
+                    return {"price": 0.0, "chg_pct": 0.0, "prev": 0.0}
+                data = await resp.json(content_type=None)
+
+        res  = data.get("chart", {}).get("result", [{}])[0]
+        meta = res.get("meta", {})
+
+        if live:
+            # ── Modo live (pre-mercado / futuros) ───────────────────
+            # regularMarketPrice = precio actual en tiempo real del futuro.
+            # chartPreviousClose = cierre oficial de la sesión anterior.
+            # Esto da el % de cambio real respecto al cierre de ayer.
+            price = float(meta.get("regularMarketPrice") or 0)
+            prev  = float(
+                meta.get("chartPreviousClose")
+                or meta.get("regularMarketPreviousClose")
+                or 0
+            )
+        else:
+            # ── Modo close (post-mercado) ────────────────────────────
+            # Usamos el array OHLCV diario (última vela completa) para el
+            # cierre OFICIAL de la sesión regular.
+            # Filtramos None (Yahoo rellena con null las barras incompletas)
+            closes = [
+                c for c in (res.get("indicators", {})
+                               .get("quote", [{}])[0]
+                               .get("close", []))
+                if c is not None
+            ]
+
+            if len(closes) >= 2:
+                price = float(closes[-1])
+                prev  = float(closes[-2])
+            elif len(closes) == 1:
+                price = float(closes[0])
+                prev  = float(
+                    meta.get("chartPreviousClose")
+                    or meta.get("regularMarketPreviousClose")
+                    or 0
+                )
             else:
-                prev = float(meta.get("previousClose", 0) or 0)
-                chg  = ((price - prev) / prev * 100) if prev else 0.0
-            return name, {"price": price, "chg_pct": chg}
+                price = float(meta.get("regularMarketPrice") or 0)
+                prev  = float(
+                    meta.get("chartPreviousClose")
+                    or meta.get("regularMarketPreviousClose")
+                    or 0
+                )
+
+        chg = ((price - prev) / prev * 100) if prev else 0.0
+        logger.debug(f"Yahoo {sym} (live={live}): price={price:.2f}  prev={prev:.2f}  chg={chg:+.2f}%")
+        return {"price": price, "chg_pct": chg, "prev": prev}
+
     except Exception as e:
-        logger.debug(f"Futures {name}: {e}")
-        return name, None
+        logger.debug(f"Yahoo API {sym}: {e}")
+        return {"price": 0.0, "chg_pct": 0.0, "prev": 0.0}
 
 
 async def _fetch_futures() -> Dict[str, dict]:
+    """
+    Precios de futuros en tiempo real (para pre-mercado).
+    Usa live=True para obtener regularMarketPrice vs cierre de ayer.
+    """
     result: Dict[str, dict] = {}
-    async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
-        tasks = [
-            _fetch_one_future(session, name, sym)
-            for name, sym in _FUTURES_TICKERS.items()
-        ]
-        for name, data in await asyncio.gather(*tasks):
-            if data is not None:
-                result[name] = data
+    tasks = {
+        name: _yf_quote_async(sym, live=True)
+        for name, sym in _FUTURES_TICKERS.items()
+    }
+    for name, coro in tasks.items():
+        data = await coro
+        if data["price"]:
+            result[name] = data
+    logger.debug(f"Futuros: { {k: (v['price'], v['chg_pct']) for k, v in result.items()} }")
     return result
 
 
 async def _fetch_vix() -> float:
-    timeout = aiohttp.ClientTimeout(total=8)
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=2d"
-        async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    meta = data["chart"]["result"][0]["meta"]
-                    return float(meta.get("regularMarketPrice", 20))
+        data = await _yf_quote_async("%5EVIX", live=True)
+        return data["price"]
     except Exception as e:
         logger.debug(f"VIX: {e}")
     return 0.0
@@ -701,44 +899,96 @@ async def _fetch_news() -> List[str]:
     return []
 
 
-async def _fetch_one_market(session: aiohttp.ClientSession, name: str, sym: str) -> tuple:
-    timeout = aiohttp.ClientTimeout(total=8)
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
-        async with session.get(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return name, None
-            data   = await resp.json()
-            res    = data["chart"]["result"][0]
-            meta   = res["meta"]
-            closes = res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-            closes = [c for c in closes if c is not None]
+async def _fetch_ib_quotes(ib, spot_sp500: bool = False, frozen: bool = False) -> Dict[str, dict]:
+    """
+    Cotizaciones directas de IB Gateway (sin suscripción RT, datos retrasados 15 min).
+    spot_sp500=False (pre-mercado):  S&P 500 = ES futuros (indica dirección apertura)
+    spot_sp500=True  (post-mercado): S&P 500 = SPX índice spot (cierre oficial del índice)
+    Nasdaq siempre = NQ futuros (~29.000), VIX = índice spot CBOE.
 
-            price = float(meta.get("regularMarketPrice", closes[-1] if closes else 0))
-            # Prioridad: regularMarketChangePercent del meta (siempre vs previousClose real)
-            # Fallback: calcular manualmente con previousClose explícito del meta
-            chg_meta = meta.get("regularMarketChangePercent")
-            if chg_meta is not None:
-                chg = float(chg_meta)
-            else:
-                prev = float(meta.get("previousClose", 0) or 0)
-                chg  = ((price - prev) / prev * 100) if prev else 0.0
-            return name, {"price": price, "chg_pct": chg}
-    except Exception as e:
-        logger.debug(f"Market data {name}: {e}")
-        return name, None
+    frozen=False → tipo 3 (Delayed streaming): precio actual con 15 min de retraso.
+                   CORRECTO para pre-mercado: refleja el precio pre-market de los futuros ES/NQ.
+    frozen=True  → tipo 4 (Delayed-Frozen): precio congelado al cierre de la sesión regular.
+                   CORRECTO para post-mercado: devuelve el cierre oficial del índice/futuro.
+
+    ¡IMPORTANTE! Tipo 4 en pre-mercado devuelve el cierre de AYER, no el precio actual.
+    Por eso el informe mostraba un valor ~20 puntos distinto al real: era el cierre anterior.
+    """
+    import math
+    from ib_insync import ContFuture, Index
+
+    sp_contract = Index("SPX", "CBOE", currency="USD") if spot_sp500 else ContFuture("ES", "CME", currency="USD")
+    items = [
+        ("S&P 500", sp_contract),
+        ("Nasdaq",  ContFuture("NQ", "CME", currency="USD")),
+        ("VIX",     Index("VIX", "CBOE", currency="USD")),
+    ]
+    result: Dict[str, dict] = {}
+    try:
+        names     = [n for n, _ in items]
+        contracts = [c for _, c in items]
+        # Tipo 3 = Delayed streaming (precio actual -15 min, ideal para pre-mercado)
+        # Tipo 4 = Delayed-Frozen (precio del último cierre, ideal para post-mercado)
+        ib.reqMarketDataType(4 if frozen else 3)
+        qualified = await asyncio.wait_for(
+            ib.qualifyContractsAsync(*contracts), timeout=10
+        )
+        if not qualified:
+            logger.warning("IB market data: contratos no calificados")
+            return result
+        tickers = await asyncio.wait_for(
+            ib.reqTickersAsync(*qualified), timeout=10
+        )
+        for name, ticker in zip(names, tickers):
+            price = ticker.marketPrice()
+            close = ticker.close or 0.0
+            if math.isnan(price): price = 0.0
+            if math.isnan(close): close = 0.0
+            if not price:
+                logger.debug(f"IB {name}: sin precio")
+                continue
+            chg = ((price - close) / close * 100) if close else 0.0
+            result[name] = {"price": price, "chg_pct": chg, "prev": close}
+            logger.debug(f"IB {name}: price={price:.2f}  prev={close:.2f}  chg={chg:+.2f}%")
+    except asyncio.TimeoutError:
+        logger.warning("IB market data: timeout (>10s)")
+    except Exception as exc:
+        logger.warning(f"IB market data error: {exc}")
+    finally:
+        # Restaurar modo normal (no afectar al resto de operaciones del bot)
+        try:
+            ib.reqMarketDataType(1)
+        except Exception:
+            pass
+    return result
 
 
 async def _fetch_market_data() -> Dict[str, dict]:
+    """
+    Obtiene datos de mercado para el informe post-mercado.
+    - S&P 500: ^GSPC (spot, precio oficial de cierre del índice ~7.432)
+    - Nasdaq:  NQ=F  (futuros Nasdaq 100 ~29.297, NO el Composite ^IXIC ~26.000)
+    - VIX:     ^VIX  (spot)
+    """
     result: Dict[str, dict] = {}
-    async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
-        tasks = [
-            _fetch_one_market(session, name, sym)
-            for name, sym in _MARKET_TICKERS.items()
-        ]
-        for name, data in await asyncio.gather(*tasks):
-            if data is not None:
-                result[name] = data
+
+    # S&P 500: spot index — refleja el cierre oficial del índice
+    sp_data = await _yf_quote_async("%5EGSPC")
+    if sp_data["price"]:
+        result["S&P 500"] = sp_data
+
+    # Nasdaq 100: futuros NQ=F — precio ~29.000 que ve el usuario
+    # (NO usar ^IXIC que es el Composite y cotiza ~26.000)
+    nq_data = await _yf_quote_async("NQ=F")
+    if nq_data["price"]:
+        result["Nasdaq"] = nq_data
+
+    # VIX: solo spot
+    vix_data = await _yf_quote_async("%5EVIX")
+    if vix_data["price"]:
+        result["VIX"] = vix_data
+
+    logger.debug(f"Mercados: { {k: (v['price'], v['chg_pct']) for k, v in result.items()} }")
     return result
 
 
