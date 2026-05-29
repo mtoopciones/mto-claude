@@ -54,6 +54,7 @@ ib_ref: Optional[IB] = None
 facebook_poster = None
 instagram_poster = None
 twitter_poster = None
+approver = None
 
 ROLL_WINDOW = 60  # segundos para detectar roll
 _pending_close: Dict[tuple, dict] = {}  # {(account, symbol, right): {...}}
@@ -599,6 +600,27 @@ async def _publish_trade(
             f"| {account_info['name']}"
         )
 
+    # ── Revisión con botones → social_webhook ────────────────
+    social_wh = account_info.get("social_webhook", "")
+    if social_wh and approver:
+        from .discord import _build_apertura_embed, _build_cierre_embed
+        is_open = event_type in (TradeEvent.OPEN, TradeEvent.ADD)
+        icon    = "🟢" if is_open else ("🔴" if event_type == TradeEvent.CLOSE else "🟠")
+        if is_open:
+            embed = _build_apertura_embed(strategy, metrics, event_type, logo_url, account_info["name"])
+        else:
+            embed = _build_cierre_embed(strategy, metrics, event_type, logo_url, account_info["name"])
+        header = (
+            f"{icon} **{strategy.short_name}  {strategy.underlying}**  ·  "
+            f"{account_info['name']}  —  lista para publicar"
+        )
+        asyncio.ensure_future(approver.post_for_review(
+            embeds=[embed],
+            report_type="operacion",
+            publish_webhook=social_wh,
+            header=header,
+        ))
+
     await log_channel.send_trade_confirmation(
         account_name=account_info["name"],
         event_type=event_type,
@@ -731,6 +753,25 @@ async def _publish_roll(
             f"| {account_info['name']}"
         )
 
+    # ── Revisión con botones → social_webhook ────────────────
+    social_wh = account_info.get("social_webhook", "")
+    if social_wh and approver:
+        from .discord import _build_apertura_embed, _build_cierre_embed
+        close_embed = _build_cierre_embed(close_strategy, close_metrics, TradeEvent.CLOSE, logo_url, account_info["name"])
+        open_embed  = _build_apertura_embed(open_strategy, open_metrics, TradeEvent.OPEN, logo_url, account_info["name"])
+        close_embed["author"]["name"] = f"🔄  ROLL — CIERRE  /  {close_strategy.underlying}"
+        open_embed["author"]["name"]  = f"🔄  ROLL — APERTURA  /  {open_strategy.underlying}"
+        header = (
+            f"🔄 **ROLL  {open_strategy.underlying}**  ·  "
+            f"{account_info['name']}  —  lista para publicar"
+        )
+        asyncio.ensure_future(approver.post_for_review(
+            embeds=[close_embed, open_embed],
+            report_type="operacion",
+            publish_webhook=social_wh,
+            header=header,
+        ))
+
     await log_channel.send_trade_confirmation(
         account_name=account_info["name"],
         event_type=TradeEvent.ROLL,
@@ -851,7 +892,7 @@ def setup_logging(log_cfg: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 
 async def main_async() -> None:
-    global cfg, account_map, log_channel, fill_collector, daily_reporter, weekly_analyst, pnl_tracker, portfolio_tracker, logbook, facebook_poster, instagram_poster, twitter_poster
+    global cfg, account_map, log_channel, fill_collector, daily_reporter, weekly_analyst, pnl_tracker, portfolio_tracker, logbook, facebook_poster, instagram_poster, twitter_poster, approver
 
     cfg         = cfg_module.load("config.yaml")
     account_map = cfg_module.account_map(cfg)
@@ -958,7 +999,6 @@ async def main_async() -> None:
         await weekly_analyst.start()
 
     # ── Discord Approver (revisión de informes con botones) ──────
-    approver = None
     if cfg.get("discord", {}).get("bot_token") and cfg.get("discord", {}).get("review_webhook"):
         approver = DiscordApprover(
             cfg=cfg,
