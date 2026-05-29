@@ -930,10 +930,26 @@ async def main_async() -> None:
     debounce           = discord_cfg.get("fill_debounce_seconds", 3)
     account_names      = [a["name"] for a in cfg.get("accounts", [])]
 
+    def _systems_status() -> dict:
+        """Estado de todos los subsistemas para el heartbeat horario."""
+        return {
+            "Facebook":         facebook_poster  is not None,
+            "Instagram":        instagram_poster is not None,
+            "Twitter/X":        twitter_poster   is not None,
+            "Daily Reporter":   daily_reporter   is not None,
+            "Weekly Analyst":   weekly_analyst   is not None,
+            "PnL Tracker":      pnl_tracker      is not None,
+            "Portfolio":        portfolio_tracker is not None,
+            "Logbook Excel":    logbook          is not None,
+            "Discord Approver": approver         is not None,
+        }
+
     log_channel = LogChannel(
         webhook_url=discord_cfg["log_webhook"],
         heartbeat_interval=heartbeat_interval,
         account_names=account_names,
+        get_ib_connected=lambda: ib_ref is not None and ib_ref.isConnected(),
+        get_systems=_systems_status,
     )
 
     fill_collector = FillCollector(
