@@ -103,10 +103,59 @@ async def download_video(video_id: str, output_path: str) -> bool:
 
 # ── Transcript con timestamps ─────────────────────────────────
 
-async def get_transcript_with_timestamps(video_id: str) -> Optional[List[dict]]:
+def _parse_vtt(vtt_path: str) -> List[dict]:
+    """Parsea un archivo VTT y devuelve [{text, start, duration}]."""
+    import re as _re
+    entries = []
+    seen_text = set()
+    try:
+        with open(vtt_path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        # Bloques: timestamp --> timestamp\ntext
+        blocks = _re.split(r"\n\n+", content)
+        for block in blocks:
+            lines = block.strip().splitlines()
+            # Buscar línea de tiempo: 00:00:12.000 --> 00:00:15.000
+            ts_line = next((l for l in lines if "-->" in l), None)
+            if not ts_line:
+                continue
+            parts = ts_line.split("-->")
+            start = _vtt_time_to_sec(parts[0].strip().split()[0])
+            end   = _vtt_time_to_sec(parts[1].strip().split()[0])
+            # Texto: líneas que no son timestamps ni cabeceras
+            text_lines = [
+                _re.sub(r"<[^>]+>", "", l).strip()
+                for l in lines
+                if "-->" not in l and not l.startswith("WEBVTT") and l.strip()
+            ]
+            text = " ".join(text_lines).strip()
+            if text and text not in seen_text:
+                seen_text.add(text)
+                entries.append({"text": text, "start": start, "duration": max(end - start, 0.1)})
+    except Exception as e:
+        logger.warning(f"VideoProcessor: error parseando VTT: {e}")
+    return entries
+
+
+def _vtt_time_to_sec(t: str) -> float:
+    """'00:01:23.456' → 83.456"""
+    t = t.replace(",", ".")
+    parts = t.split(":")
+    if len(parts) == 3:
+        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return float(parts[0]) * 60 + float(parts[1])
+    return float(parts[0])
+
+
+async def get_transcript_with_timestamps(video_id: str, tmpdir: Optional[str] = None) -> Optional[List[dict]]:
     """
-    Devuelve lista de {text, start, duration} o None si no hay transcript.
+    Devuelve lista de {text, start, duration}.
+    Estrategia:
+      1. youtube-transcript-api (rápido, sin descarga)
+      2. yt-dlp auto-captions (funciona con cookies aunque la API falle)
     """
+    # ── Estrategia 1: youtube-transcript-api ──
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         loop = asyncio.get_event_loop()
@@ -116,10 +165,46 @@ async def get_transcript_with_timestamps(video_id: str) -> Optional[List[dict]]:
                 video_id, languages=["es", "es-ES", "es-MX", "es-419", "en", "en-US"]
             )
         )
-        return entries  # [{text, start, duration}, ...]
+        if entries:
+            logger.info(f"VideoProcessor: transcript via API ({len(entries)} entradas)")
+            return entries
     except Exception as e:
-        logger.warning(f"VideoProcessor: sin transcript para {video_id}: {e}")
-        return None
+        logger.debug(f"VideoProcessor: transcript API falló — {e}")
+
+    # ── Estrategia 2: yt-dlp auto-captions ──
+    try:
+        use_tmp = tmpdir is None
+        _tmpdir = tempfile.mkdtemp(prefix="mto_subs_") if use_tmp else tmpdir
+        try:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            cmd = [
+                _ytdlp_bin(),
+                "--write-auto-sub", "--skip-download",
+                "--sub-langs", "es.*,en.*,es,en",
+                "--sub-format", "vtt",
+                "--output", os.path.join(_tmpdir, "%(id)s.%(ext)s"),
+                "--no-playlist", "--quiet",
+                "--remote-components", "ejs:github",
+            ]
+            if os.path.exists(_COOKIES_FILE):
+                cmd += ["--cookies", _COOKIES_FILE]
+            cmd.append(url)
+            await _run_async(cmd, timeout=60)
+
+            for fname in os.listdir(_tmpdir):
+                if fname.endswith(".vtt") and video_id in fname:
+                    entries = _parse_vtt(os.path.join(_tmpdir, fname))
+                    if entries:
+                        logger.info(f"VideoProcessor: transcript via yt-dlp ({len(entries)} entradas)")
+                        return entries
+        finally:
+            if use_tmp:
+                import shutil
+                shutil.rmtree(_tmpdir, ignore_errors=True)
+    except Exception as e:
+        logger.warning(f"VideoProcessor: yt-dlp subtítulos falló — {e}")
+
+    return None
 
 
 # ── Selección de segmentos con Claude ─────────────────────────
@@ -197,10 +282,57 @@ async def select_best_segments(
 
 # ── Cortar y unir con ffmpeg ──────────────────────────────────
 
+def _build_srt(segments: List[dict], transcript: List[dict]) -> str:
+    """
+    Genera un archivo SRT con los subtítulos de los segmentos seleccionados,
+    reajustando los timestamps al tiempo del reel concatenado.
+    """
+    def fmt_ts(secs: float) -> str:
+        h = int(secs // 3600)
+        m = int((secs % 3600) // 60)
+        s = int(secs % 60)
+        ms = int((secs % 1) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    lines = []
+    idx = 1
+    reel_offset = 0.0
+
+    for seg in segments:
+        seg_start = seg["start"]
+        seg_end   = seg["end"]
+        seg_dur   = seg_end - seg_start
+
+        # Subtítulos de este segmento
+        for e in transcript:
+            e_start = e["start"]
+            e_end   = e_start + e["duration"]
+            # Intersección con el segmento
+            if e_end <= seg_start or e_start >= seg_end:
+                continue
+            clip_start = max(e_start, seg_start) - seg_start + reel_offset
+            clip_end   = min(e_end,   seg_end)   - seg_start + reel_offset
+            text = e["text"].strip()
+            if not text:
+                continue
+            lines += [
+                str(idx),
+                f"{fmt_ts(clip_start)} --> {fmt_ts(clip_end)}",
+                text,
+                "",
+            ]
+            idx += 1
+
+        reel_offset += seg_dur
+
+    return "\n".join(lines)
+
+
 async def create_highlight_reel(
     video_path: str,
     segments: List[dict],
     output_path: str,
+    transcript: Optional[List[dict]] = None,
 ) -> bool:
     """
     Usa ffmpeg para cortar los segmentos y concatenarlos.
@@ -259,7 +391,8 @@ async def create_highlight_reel(
             for sp in segment_files:
                 f.write(f"file '{sp}'\n")
 
-        # 3. Concatenar
+        # 3. Concatenar (sin subtítulos primero)
+        concat_path = output_path + ".concat.mp4"
         cmd_concat = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
@@ -267,12 +400,54 @@ async def create_highlight_reel(
             "-c", "copy",
             "-movflags", "+faststart",
             "-loglevel", "error",
-            output_path,
+            concat_path,
         ]
         stdout, stderr, code = await _run_async(cmd_concat)
         if code != 0:
             logger.error(f"VideoProcessor: ffmpeg concat error: {stderr[:200]}")
             return False
+
+        # 4. Grabar subtítulos en el vídeo (burned-in) si hay transcript
+        if transcript:
+            srt_path = os.path.join(tmpdir, "subs.srt")
+            srt_content = _build_srt(segments, transcript)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+
+            # Subtítulos: fondo semitransparente, centrado abajo, fuente grande
+            sub_filter = (
+                f"subtitles='{srt_path}':force_style='"
+                "FontName=DejaVu Sans Bold,"
+                "FontSize=18,"
+                "PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"
+                "BackColour=&H80000000,"
+                "BorderStyle=4,"
+                "Outline=2,"
+                "Shadow=0,"
+                "Alignment=2,"
+                "MarginV=30"
+                "'"
+            )
+            cmd_subs = [
+                "ffmpeg", "-y",
+                "-i", concat_path,
+                "-vf", sub_filter,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                "-loglevel", "error",
+                output_path,
+            ]
+            _, stderr_s, code_s = await _run_async(cmd_subs, timeout=120)
+            if code_s == 0 and os.path.exists(output_path):
+                os.remove(concat_path)
+                logger.info("VideoProcessor: subtítulos grabados en el reel")
+            else:
+                logger.warning(f"VideoProcessor: subtítulos fallaron ({stderr_s[:100]}), usando sin subtítulos")
+                os.rename(concat_path, output_path)
+        else:
+            os.rename(concat_path, output_path)
 
         if not os.path.exists(output_path):
             return False
@@ -368,9 +543,9 @@ async def process_youtube_to_reel(
             result["error"] = "No se pudo descargar el vídeo (comprueba las cookies de YouTube)"
             return result
 
-        # 2. Obtener transcript con timestamps
-        logger.info("VideoProcessor: obteniendo transcript...")
-        transcript = await get_transcript_with_timestamps(video_id)
+        # 2. Obtener transcript con timestamps (usando tmpdir para los VTT de yt-dlp)
+        logger.info("VideoProcessor: obteniendo transcript con timestamps...")
+        transcript = await get_transcript_with_timestamps(video_id, tmpdir=tmpdir)
         if not transcript:
             result["error"] = "El vídeo no tiene subtítulos disponibles para seleccionar segmentos"
             return result
@@ -383,9 +558,9 @@ async def process_youtube_to_reel(
             return result
         result["segments"] = segments
 
-        # 4. Crear el reel con ffmpeg
-        logger.info(f"VideoProcessor: creando reel ({len(segments)} segmentos)...")
-        ok = await create_highlight_reel(video_path, segments, output_path)
+        # 4. Crear el reel con ffmpeg (con subtítulos grabados)
+        logger.info(f"VideoProcessor: creando reel ({len(segments)} segmentos) con subtítulos...")
+        ok = await create_highlight_reel(video_path, segments, output_path, transcript=transcript)
         if not ok:
             result["error"] = "Error al cortar y unir los segmentos con ffmpeg"
             return result
