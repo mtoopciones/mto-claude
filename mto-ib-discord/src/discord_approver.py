@@ -639,18 +639,53 @@ class DiscordApprover:
             summary = await generate_summary(content, source, video_url, self.anthropic_key)
             embed = build_embed(summary, video_url, source)
 
+            # ── Intentar generar el reel de 45s ──────────────────────
+            reel_bytes = None
+            reel_script = ""
+            try:
+                from .video_processor import process_youtube_to_reel
+                await message.reply("🎬 Generando reel de 45s… esto puede tardar 1-2 minutos")
+                reel_result = await process_youtube_to_reel(video_id, self.anthropic_key)
+                if reel_result.get("video_bytes"):
+                    reel_bytes  = reel_result["video_bytes"]
+                    reel_script = reel_result.get("script", "")
+                    logger.info(f"YouTubeProcessor: reel generado ({len(reel_bytes)/1024/1024:.1f} MB)")
+                elif reel_result.get("error"):
+                    logger.warning(f"YouTubeProcessor: reel no generado — {reel_result['error']}")
+                    await message.reply(f"⚠️ Reel no generado: {reel_result['error']}\nSe publicará solo el resumen.")
+            except Exception as e_reel:
+                logger.warning(f"YouTubeProcessor: error generando reel — {e_reel}")
+
             try:
                 await message.remove_reaction("⏳", self.client.user)
                 await message.add_reaction("✅")
             except Exception:
                 pass
 
+            # Si hay reel, usarlo como guión principal del embed
+            if reel_script:
+                embed["description"] = reel_script
+                embed["title"] = "🎬 Reel de 45s listo para publicar"
+                embed["footer"]["text"] = f"Fuente: {video_url} · Reel generado automáticamente"
+
+            header = f"{'🎬' if reel_bytes else '📺'} **{'Reel' if reel_bytes else 'Video'} listo para publicar** — <{video_url}>"
+
             await self.post_for_review(
                 embeds=[embed],
                 report_type="youtube",
                 publish_webhook=self.youtube_publish_webhook,
-                header=f"📺 **Video listo para publicar en redes** — <{video_url}>",
+                header=header,
+                social_image_bytes=reel_bytes,   # el vídeo se usará en redes sociales
             )
+
+            # Enviar el vídeo directamente al canal de revisión si está disponible
+            if reel_bytes and self._channel_id:
+                channel = self.client.get_channel(self._channel_id)
+                if channel:
+                    await channel.send(
+                        content=f"🎬 **Reel 45s** — {video_url}",
+                        file=discord.File(io.BytesIO(reel_bytes), filename="reel_45s.mp4"),
+                    )
             logger.info(f"YouTubeProcessor: resumen publicado para revisión — {video_url}")
 
         except Exception as e:
