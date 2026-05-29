@@ -127,6 +127,38 @@ def _load_fonts() -> dict:
     return _FONTS
 
 
+# ── QR Code ──────────────────────────────────────────────────
+_QR_IMG: Optional["Image.Image"] = None
+_QR_URL = "https://www.mtoopciones.com"
+
+def _get_qr(size: int = 70) -> Optional["Image.Image"]:
+    """Genera (y cachea) el QR de www.mtoopciones.com."""
+    global _QR_IMG
+    if not PIL_AVAILABLE:
+        return None
+    if _QR_IMG is None:
+        try:
+            import qrcode
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=3,
+                border=2,
+            )
+            qr.add_data(_QR_URL)
+            qr.make(fit=True)
+            _QR_IMG = qr.make_image(
+                fill_color=(28, 33, 50), back_color="white"
+            ).convert("RGB")
+        except ImportError:
+            logger.warning("qrcode no disponible — pip install qrcode[pil]")
+            return None
+        except Exception as e:
+            logger.warning(f"QR no generado: {e}")
+            return None
+    return _QR_IMG.resize((size, size), Image.LANCZOS)
+
+
 # ── Logo ─────────────────────────────────────────────────────
 _LOGO: Optional["Image.Image"] = None
 
@@ -398,6 +430,14 @@ def _draw_card(strategy: StrategyInfo, metrics: TradeMetrics,
     draw.text((tx, y + 14), strat_txt, font=fonts["ttl"], fill=TEXT)
     draw.text((tx, y + 56), ev_lbl, font=fonts["med"], fill=accent)
     draw.text((tx, y + 80), account_name, font=fonts["xs"], fill=TEXT_GRAY)
+
+    # QR code — top-right del header
+    qr = _get_qr(70)
+    if qr:
+        qr_x = W - PAD - 70
+        qr_y = y + (HDR_H - 70) // 2
+        img.paste(qr, (qr_x, qr_y))
+
     y += HDR_H
 
     # ── COMPANY ROW ───────────────────────────────────────────
@@ -637,6 +677,12 @@ def _draw_roll_card(close_strategy: StrategyInfo, close_metrics: TradeMetrics,
     draw.text((tx, y + 14), f"{open_strategy.short_name} / {open_strategy.name}", font=fonts["ttl"], fill=TEXT)
     draw.text((tx, y + 56), "ROLL DE POSICION", font=fonts["med"], fill=roll_accent)
     draw.text((tx, y + 80), account_name, font=fonts["xs"], fill=TEXT_GRAY)
+
+    # QR code — top-right del header
+    qr = _get_qr(70)
+    if qr:
+        img.paste(qr, (W - PAD - 70, y + (HDR_H - 70) // 2))
+
     y += HDR_H
 
     # ── COMPANY ROW ───────────────────────────────────────────

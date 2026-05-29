@@ -726,6 +726,12 @@ class DiscordApprover:
                 "instagram": "cercano y visual, usa emojis con moderación, invita a ver el video",
                 "facebook":  "reflexivo y accesible, invita al debate sobre el tema del video",
             }.get(network, "atractivo y conciso")
+        elif report_type == "operacion":
+            network_tone = {
+                "twitter":   "directo e impactante, genera curiosidad sobre la operación",
+                "instagram": "cercano y visual, invita a unirse a la comunidad",
+                "facebook":  "profesional y accesible, invita a conocer más sobre la estrategia",
+            }.get(network, "atractivo y directo")
         else:
             network_tone = {
                 "twitter":   "directo, impactante, cada tweet del hilo debe funcionar solo (el hilo puede tener varios tweets)",
@@ -758,11 +764,31 @@ class DiscordApprover:
                     "Ejemplo: TITULAR\n\"S&P 500 alcanza máximos históricos ante expectativas de tipos\"\n"
                 )
 
+        # Instrucciones adicionales específicas por tipo de informe
+        operacion_extra = ""
+        if report_type == "operacion":
+            operacion_extra = (
+                "\n\nINSTRUCCIONES ESPECIALES PARA PUBLICACIÓN DE OPERACIÓN:\n"
+                "Esta publicación muestra una operación real de nuestra cartera. El texto debe:\n"
+                "1. VARIAR en cada publicación — no uses siempre las mismas frases de inicio\n"
+                "2. Mencionar si es APERTURA o CIERRE (léelo del embed: 'APERTURA DE OPERACION' o 'CIERRE DE OPERACION')\n"
+                "3. Para APERTURA: destacar la prima cobrada (campo 'Prima +/- comision') y el ticker con $\n"
+                "   Ej: 'Nueva operación abierta en $TICKER — hemos cobrado $XXX de prima'\n"
+                "4. Para CIERRE: destacar el resultado (campo 'Resultado') positivo o negativo\n"
+                "   Ej: 'Cerramos $TICKER con +$XXX de beneficio' / 'Cerramos $TICKER asumiendo -$XXX'\n"
+                "5. Mencionar que esto ocurre en nuestro canal PRIVADO de Discord\n"
+                "6. SIEMPRE terminar con esta frase (o variante): "
+                "'Escanea el QR de la imagen o visita mtoopciones.com para unirte a la comunidad'\n"
+                "7. NO incluyas strikes, DTE, buying power ni detalles técnicos — solo lo esencial\n"
+                "8. Tono: cercano, como compartiendo un logro con la comunidad\n"
+            )
+
         prompt = (
             f"Eres el editor de contenido de MTO Opciones, comunidad de trading de opciones "
             f"para hispanohablantes (España y Latinoamérica).\n\n"
             f"INFORME ORIGINAL:\n---\n{base_text}\n---\n\n"
             f"Tu tarea: crear el texto completo para publicar en {network.upper()}.\n\n"
+            f"{operacion_extra}"
             f"REGLA OBLIGATORIA — CASHTAGS: Siempre que aparezca un ticker de acción, ETF o índice "
             f"(SOFI, IBIT, HIMS, SPY, QQQ, AAPL, TSLA, SPX, VIX, etc.) escríbelo con el símbolo $ "
             f"delante: $SOFI, $IBIT, $HIMS, $SPY, $QQQ... Esto crea hipervínculos y amplía el "
