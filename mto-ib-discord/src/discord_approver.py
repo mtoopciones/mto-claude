@@ -666,7 +666,7 @@ class DiscordApprover:
             if reel_script:
                 embed["description"] = reel_script
                 embed["title"] = "🎬 Reel de 45s listo para publicar"
-                embed["footer"]["text"] = f"Fuente: {video_url} · Reel generado automáticamente"
+                embed.pop("footer", None)  # sin footer de fuente
 
             header = f"{'🎬' if reel_bytes else '📺'} **{'Reel' if reel_bytes else 'Video'} listo para publicar** — <{video_url}>"
 

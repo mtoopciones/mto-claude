@@ -414,19 +414,21 @@ async def create_highlight_reel(
             with open(srt_path, "w", encoding="utf-8") as f:
                 f.write(srt_content)
 
-            # Subtítulos: fondo semitransparente, centrado abajo, fuente grande
+            # Subtítulos: texto pequeño en la franja negra inferior, sin tapar el vídeo
             sub_filter = (
                 f"subtitles='{srt_path}':force_style='"
                 "FontName=DejaVu Sans Bold,"
-                "FontSize=18,"
+                "FontSize=13,"
                 "PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,"
-                "BackColour=&H80000000,"
+                "BackColour=&HAA000000,"
                 "BorderStyle=4,"
-                "Outline=2,"
+                "Outline=1,"
                 "Shadow=0,"
                 "Alignment=2,"
-                "MarginV=30"
+                "MarginV=580,"
+                "MarginL=40,"
+                "MarginR=40"
                 "'"
             )
             cmd_subs = [
