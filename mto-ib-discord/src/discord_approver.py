@@ -774,14 +774,25 @@ class DiscordApprover:
             if report_type == "premarket":
                 ig_format_note += (
                     "\nESTRUCTURA OBLIGATORIA del CONTENIDO para informe PRE-APERTURA:\n"
-                    "1. Sección 'FUTUROS' con UNA línea por índice en este formato exacto:\n"
+                    "1. Sección 'FUTUROS' con UNA línea por índice en este formato EXACTO "
+                    "(el parser de imagen lo requiere — no cambies el formato ni añadas $ delante):\n"
                     "   S&P 500   [valor numérico]   [+X.XX%]\n"
                     "   Nasdaq    [valor numérico]   [+X.XX%]\n"
                     "   VIX       [valor numérico]\n"
                     "2. Sección 'AGENDA MACRO' con los eventos del día (una línea por evento, con •)\n"
                     "   Si no hay eventos: escribe '• Sin eventos macro relevantes hoy'\n"
                     "3. Si hay titular de noticias relevante: sección 'TITULAR' con el texto entre comillas\n"
-                    "Ejemplo: TITULAR\n\"S&P 500 alcanza máximos históricos ante expectativas de tipos\"\n"
+                )
+            elif report_type == "postmarket":
+                ig_format_note += (
+                    "\nESTRUCTURA OBLIGATORIA del CONTENIDO para informe CIERRE DE MERCADO:\n"
+                    "1. Sección 'MERCADOS' con UNA línea por índice en este formato EXACTO "
+                    "(el parser de imagen lo requiere — no cambies el formato ni añadas $ delante):\n"
+                    "   S&P 500   [valor numérico]   [+X.XX%]\n"
+                    "   Nasdaq    [valor numérico]   [+X.XX%]\n"
+                    "   VIX       [valor numérico]\n"
+                    "2. Sección 'OPERACIONES MTO' con las operaciones del día (apertura/cierre/roll)\n"
+                    "   Si no hay operaciones: escribe '• Sin operaciones registradas hoy'\n"
                 )
 
         # Instrucciones adicionales específicas por tipo de informe
@@ -803,16 +814,29 @@ class DiscordApprover:
                 "8. Tono: cercano, como compartiendo un logro con la comunidad\n"
             )
 
+        # Regla de cashtags diferenciada por red
+        if network == "twitter":
+            _cashtag_rule = (
+                "REGLA CASHTAGS para Twitter/X: Twitter permite MÁXIMO 1 cashtag ($SÍMBOLO) por tweet — "
+                "si pones más de uno el tweet falla con error 403. "
+                "USA $ SOLO para el ticker principal de la operación (ej: $CELH, $SOFI, $IBIT). "
+                "Para índices escribe el nombre COMPLETO SIN $: 'S&P 500', 'Nasdaq', 'VIX', 'SPX'. "
+                "NUNCA pongas $SPX, $NDX, $QQQ, $SPY ni $VIX — violan la norma de Twitter.\n\n"
+            )
+        else:
+            _cashtag_rule = (
+                "REGLA CASHTAGS: Usa $TICKER para acciones y ETFs operados (ej: $CELH, $SOFI, $IBIT). "
+                "Para índices escribe el nombre completo SIN $: 'S&P 500', 'Nasdaq', 'VIX' "
+                "(el parser de la imagen de Instagram necesita esos nombres exactos para mostrar los datos).\n\n"
+            )
+
         prompt = (
             f"Eres el editor de contenido de MTO Opciones, comunidad de trading de opciones "
             f"para hispanohablantes (España y Latinoamérica).\n\n"
             f"INFORME ORIGINAL:\n---\n{base_text}\n---\n\n"
             f"Tu tarea: crear el texto completo para publicar en {network.upper()}.\n\n"
             f"{operacion_extra}"
-            f"REGLA OBLIGATORIA — CASHTAGS: Siempre que aparezca un ticker de acción, ETF o índice "
-            f"(SOFI, IBIT, HIMS, SPY, QQQ, AAPL, TSLA, SPX, VIX, etc.) escríbelo con el símbolo $ "
-            f"delante: $SOFI, $IBIT, $HIMS, $SPY, $QQQ... Esto crea hipervínculos y amplía el "
-            f"alcance en todas las redes sociales. Aplica esta regla a TODOS los tickers del texto.\n\n"
+            f"{_cashtag_rule}"
             f"FORMATO OBLIGATORIO:\n"
             f"1. INTRODUCCIÓN: 1-2 frases que enganchen ({network_tone})\n"
             f"2. CONTENIDO: el informe adaptado levemente al tono de {network} "
