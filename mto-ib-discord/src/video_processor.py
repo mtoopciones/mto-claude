@@ -27,10 +27,28 @@ _MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB límite Discord
 
 # ── Helpers ───────────────────────────────────────────────────
 
+def _ytdlp_bin() -> str:
+    """Devuelve el path absoluto al binario yt-dlp del virtualenv."""
+    import sys
+    venv_bin = os.path.dirname(sys.executable)
+    candidate = os.path.join(venv_bin, "yt-dlp")
+    if os.path.exists(candidate):
+        return candidate
+    # Fallback: buscar en PATH
+    import shutil
+    found = shutil.which("yt-dlp")
+    return found or "yt-dlp"
+
+
 def _run_cmd(args: list, timeout: int = 120) -> Tuple[str, str, int]:
     import subprocess
+    # Añadir deno al PATH para resolver n-challenge de YouTube
+    env = os.environ.copy()
+    deno_dir = os.path.expanduser("~/.deno/bin")
+    if deno_dir not in env.get("PATH", ""):
+        env["PATH"] = deno_dir + ":" + env.get("PATH", "")
     result = subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout
+        args, capture_output=True, text=True, timeout=timeout, env=env
     )
     return result.stdout, result.stderr, result.returncode
 
@@ -51,7 +69,7 @@ async def download_video(video_id: str, output_path: str) -> bool:
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     cmd = [
-        "yt-dlp",
+        _ytdlp_bin(),
         "--no-playlist",
         "--format", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
         "--merge-output-format", "mp4",

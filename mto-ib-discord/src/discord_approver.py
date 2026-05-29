@@ -675,15 +675,16 @@ class DiscordApprover:
                 report_type="youtube",
                 publish_webhook=self.youtube_publish_webhook,
                 header=header,
-                social_image_bytes=reel_bytes,   # el vídeo se usará en redes sociales
+                target_channel_id=message.channel.id,   # mismo canal donde se pegó el link
+                social_image_bytes=reel_bytes,
             )
 
-            # Enviar el vídeo directamente al canal de revisión si está disponible
-            if reel_bytes and self._channel_id:
-                channel = self.client.get_channel(self._channel_id)
-                if channel:
-                    await channel.send(
-                        content=f"🎬 **Reel 45s** — {video_url}",
+            # Si hay reel, enviarlo también como archivo MP4 en el mismo canal
+            if reel_bytes:
+                src_channel = self.client.get_channel(message.channel.id)
+                if src_channel:
+                    await src_channel.send(
+                        content=f"🎬 **Reel 45s listo** — {video_url}",
                         file=discord.File(io.BytesIO(reel_bytes), filename="reel_45s.mp4"),
                     )
             logger.info(f"YouTubeProcessor: resumen publicado para revisión — {video_url}")
