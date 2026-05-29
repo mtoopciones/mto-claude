@@ -297,11 +297,13 @@ def _calls(s: StrategyInfo) -> List[Leg]:
 # ── Public API ───────────────────────────────────────────────
 
 def generate(strategy: StrategyInfo, metrics: TradeMetrics,
-             event_type: str, logo_url: str, account_name: str) -> Optional[bytes]:
+             event_type: str, logo_url: str, account_name: str,
+             with_qr: bool = False) -> Optional[bytes]:
     if not PIL_AVAILABLE:
         return None
     try:
-        return _draw_card(strategy, metrics, event_type, logo_url, account_name)
+        return _draw_card(strategy, metrics, event_type, logo_url, account_name,
+                          with_qr=with_qr)
     except Exception as e:
         logger.error(f"Error generando tarjeta: {e}")
         return None
@@ -310,7 +312,8 @@ def generate(strategy: StrategyInfo, metrics: TradeMetrics,
 # ── Main card ────────────────────────────────────────────────
 
 def _draw_card(strategy: StrategyInfo, metrics: TradeMetrics,
-               event_type: str, logo_url: str, account_name: str) -> bytes:
+               event_type: str, logo_url: str, account_name: str,
+               with_qr: bool = False) -> bytes:
 
     fonts   = _load_fonts()
     puts    = _puts(strategy)
@@ -431,12 +434,11 @@ def _draw_card(strategy: StrategyInfo, metrics: TradeMetrics,
     draw.text((tx, y + 56), ev_lbl, font=fonts["med"], fill=accent)
     draw.text((tx, y + 80), account_name, font=fonts["xs"], fill=TEXT_GRAY)
 
-    # QR code — top-right del header
-    qr = _get_qr(70)
-    if qr:
-        qr_x = W - PAD - 70
-        qr_y = y + (HDR_H - 70) // 2
-        img.paste(qr, (qr_x, qr_y))
+    # QR code — top-right del header (solo para publicaciones en redes)
+    if with_qr:
+        qr = _get_qr(70)
+        if qr:
+            img.paste(qr, (W - PAD - 70, y + (HDR_H - 70) // 2))
 
     y += HDR_H
 
@@ -580,13 +582,14 @@ def _draw_card(strategy: StrategyInfo, metrics: TradeMetrics,
 
 def generate_roll(close_strategy: StrategyInfo, close_metrics: TradeMetrics,
                   open_strategy: StrategyInfo, open_metrics: TradeMetrics,
-                  logo_url: str, account_name: str) -> Optional[bytes]:
+                  logo_url: str, account_name: str,
+                  with_qr: bool = False) -> Optional[bytes]:
     if not PIL_AVAILABLE:
         return None
     try:
         return _draw_roll_card(close_strategy, close_metrics,
                                open_strategy, open_metrics,
-                               logo_url, account_name)
+                               logo_url, account_name, with_qr=with_qr)
     except Exception as e:
         logger.error(f"Error generando tarjeta roll: {e}")
         return None
@@ -594,7 +597,8 @@ def generate_roll(close_strategy: StrategyInfo, close_metrics: TradeMetrics,
 
 def _draw_roll_card(close_strategy: StrategyInfo, close_metrics: TradeMetrics,
                     open_strategy: StrategyInfo, open_metrics: TradeMetrics,
-                    logo_url: str, account_name: str) -> bytes:
+                    logo_url: str, account_name: str,
+                    with_qr: bool = False) -> bytes:
 
     fonts = _load_fonts()
     c_puts  = _puts(close_strategy)
@@ -678,10 +682,11 @@ def _draw_roll_card(close_strategy: StrategyInfo, close_metrics: TradeMetrics,
     draw.text((tx, y + 56), "ROLL DE POSICION", font=fonts["med"], fill=roll_accent)
     draw.text((tx, y + 80), account_name, font=fonts["xs"], fill=TEXT_GRAY)
 
-    # QR code — top-right del header
-    qr = _get_qr(70)
-    if qr:
-        img.paste(qr, (W - PAD - 70, y + (HDR_H - 70) // 2))
+    # QR code — top-right del header (solo para publicaciones en redes)
+    if with_qr:
+        qr = _get_qr(70)
+        if qr:
+            img.paste(qr, (W - PAD - 70, y + (HDR_H - 70) // 2))
 
     y += HDR_H
 
