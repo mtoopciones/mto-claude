@@ -1,4 +1,4 @@
-"""
+﻿"""
 DiscordApprover — Sistema de revisión y aprobación de informes.
 
 Flujo:
@@ -36,6 +36,8 @@ Requiere:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 from datetime import datetime
@@ -304,7 +306,7 @@ class PersistentReviewView(ui.View):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            result = await self.approver._publish_social(ctx["embeds"], ctx["report_type"])
+            result = await self.approver._publish_social(ctx["embeds"], ctx["report_type"], message_id=str(interaction.message.id))
             await interaction.message.edit(
                 content=ctx["header"] + f"\n\n🌐 **Publicado en Redes** — {result}",
                 view=None,
@@ -329,7 +331,7 @@ class PersistentReviewView(ui.View):
         await interaction.response.defer(ephemeral=True)
         try:
             await _post_webhook(ctx["publish_webhook"], {"embeds": ctx["embeds"]})
-            result = await self.approver._publish_social(ctx["embeds"], ctx["report_type"])
+            result = await self.approver._publish_social(ctx["embeds"], ctx["report_type"], message_id=str(interaction.message.id))
             await interaction.message.edit(
                 content=ctx["header"] + f"\n\n📢 **Publicado en Discord y Redes** — {result}",
                 view=None,
@@ -367,7 +369,7 @@ class PersistentReviewView(ui.View):
             _write_log(_SOCIAL_LOG_FILE, [f"DISCORD | {ctx['report_type']} | ✅ OK (editado)"])
 
         async def pub_social(edited_embeds: List[dict]) -> str:
-            return await self.approver._publish_social(edited_embeds, ctx["report_type"])
+            return await self.approver._publish_social(edited_embeds, ctx["report_type"], message_id=msg_id_str)
 
         modal = EditModal(
             current_text       = original_txt[:_MAX_MODAL_CHARS],
@@ -440,6 +442,12 @@ class DiscordApprover:
         self._pending_reviews: Dict[str, dict] = {}
         self._load_pending()
 
+        # Imágenes en memoria para publicación social (no se persisten en JSON)
+        self._pending_images: Dict[str, bytes] = {}
+
+        # imgbb API key para subir imágenes
+        self._imgbb_api_key: str = cfg.get("instagram", {}).get("imgbb_api_key", "")
+
         # Lecciones editoriales aprendidas de ediciones anteriores
         self._learnings: Dict[str, List[dict]] = {}
         self._load_learnings()
@@ -497,6 +505,7 @@ class DiscordApprover:
 
     def _remove_pending(self, message_id: str) -> None:
         self._pending_reviews.pop(message_id, None)
+        self._pending_images.pop(message_id, None)
         self._save_pending()
 
     def _update_pending_embeds(self, message_id: str, new_embeds: List[dict]) -> None:
@@ -667,35 +676,46 @@ class DiscordApprover:
 
     async def post_for_review(
         self,
-        embeds:          List[dict],
-        report_type:     str,
-        publish_webhook: str,
-        header:          str = "📋 **Informe listo para revisión**",
+        embeds:           List[dict],
+        report_type:      str,
+        publish_webhook:  str,
+        header:           str = "📋 **Informe listo para revisión**",
+        target_channel_id: Optional[int] = None,
+        card_image_bytes:  Optional[bytes] = None,
+        social_image_bytes: Optional[bytes] = None,
     ) -> None:
-        if not self._channel_id:
+        channel_id = target_channel_id if target_channel_id is not None else self._channel_id
+        if not channel_id:
             logger.error("Discord Approver: canal de revisión no configurado — publicando directamente")
             await _post_webhook(publish_webhook, {"embeds": embeds})
             return
 
-        channel = self.client.get_channel(self._channel_id)
+        channel = self.client.get_channel(channel_id)
         if channel is None:
-            logger.error(f"Discord Approver: canal {self._channel_id} no encontrado en caché")
+            logger.error(f"Discord Approver: canal {channel_id} no encontrado en caché")
             await _post_webhook(publish_webhook, {"embeds": embeds})
             return
 
         view = PersistentReviewView(approver=self)
         try:
-            msg = await channel.send(
-                content=header,
-                embeds=_to_discord_embeds(embeds),
-                view=view,
-            )
+            send_kwargs: dict = {
+                "content": header,
+                "view": view,
+            }
+            if card_image_bytes is not None:
+                send_kwargs["file"] = discord.File(io.BytesIO(card_image_bytes), filename="trade.png")
+            else:
+                send_kwargs["embeds"] = _to_discord_embeds(embeds)
+
+            msg = await channel.send(**send_kwargs)
             self._add_pending(str(msg.id), {
                 "report_type":     report_type,
                 "publish_webhook": publish_webhook,
                 "embeds":          embeds,
                 "header":          header,
             })
+            if social_image_bytes is not None:
+                self._pending_images[str(msg.id)] = social_image_bytes
             logger.info(f"Discord Approver: '{report_type}' publicado para revisión (msg {msg.id})")
         except Exception as e:
             logger.error(f"Discord Approver: error posteando revisión: {e}")
@@ -820,7 +840,7 @@ class DiscordApprover:
 
     # ── Publicación en redes sociales ──────────────────────────────
 
-    async def _publish_social(self, embeds: List[dict], report_type: str) -> str:
+    async def _publish_social(self, embeds: List[dict], report_type: str, message_id: Optional[str] = None) -> str:
         """
         Publica en Twitter, Instagram y Facebook con intro + hashtags generados por IA.
         Registra cada publicación en logs/social_posts.log.
@@ -829,13 +849,21 @@ class DiscordApprover:
         log_lines = []
         today     = datetime.now().strftime("%Y-%m-%d")
 
+        # Recuperar imagen social si está disponible en memoria
+        social_image_bytes: Optional[bytes] = None
+        if message_id and report_type == "operacion":
+            social_image_bytes = self._pending_images.get(message_id)
+
         # ── Twitter (hilo) ────────────────────────────────────────────
         if self.twitter_poster:
             try:
                 from .twitter_poster import split_for_thread
                 text  = await self._generate_social_post(embeds, report_type, "twitter")
                 parts = split_for_thread(text, max_chars=270)
-                ok    = await self.twitter_poster.post_thread(parts)
+                if report_type == "operacion" and social_image_bytes is not None:
+                    ok = await self.twitter_poster.post_thread_with_media(parts, social_image_bytes)
+                else:
+                    ok = await self.twitter_poster.post_thread(parts)
                 status = "✅" if ok else "❌"
                 n_tweets = len(parts)
                 results.append(f"Twitter: {status} ({n_tweets} tweet{'s' if n_tweets > 1 else ''})")
@@ -853,7 +881,14 @@ class DiscordApprover:
             try:
                 text = await self._generate_social_post(embeds, report_type, "instagram")
                 text = text[:_MAX_INSTAGRAM]
-                ok   = await self.instagram_poster.post_text(text, report_type=report_type)
+                if report_type == "operacion" and social_image_bytes is not None:
+                    image_url = await self._upload_to_imgbb(social_image_bytes)
+                    if image_url:
+                        ok = await self.instagram_poster.post_image(image_url, caption=text)
+                    else:
+                        ok = await self.instagram_poster.post_text(text, report_type=report_type)
+                else:
+                    ok = await self.instagram_poster.post_text(text, report_type=report_type)
                 status = "✅" if ok else "❌"
                 results.append(f"Instagram: {status}")
                 log_lines.append(
@@ -870,7 +905,14 @@ class DiscordApprover:
             try:
                 text = await self._generate_social_post(embeds, report_type, "facebook")
                 text = text[:_MAX_FACEBOOK]
-                ok   = await self.facebook_poster.post_text(text)
+                if report_type == "operacion" and social_image_bytes is not None:
+                    image_url = await self._upload_to_imgbb(social_image_bytes)
+                    if image_url:
+                        ok = await self.facebook_poster.post_image(image_url, caption=text)
+                    else:
+                        ok = await self.facebook_poster.post_text(text)
+                else:
+                    ok = await self.facebook_poster.post_text(text)
                 status = "✅" if ok else "❌"
                 results.append(f"Facebook: {status}")
                 log_lines.append(
@@ -1131,6 +1173,34 @@ class DiscordApprover:
 
     # ── Helpers ────────────────────────────────────────────────────
 
+    async def _upload_to_imgbb(self, image_bytes: bytes) -> Optional[str]:
+        """
+        Sube image_bytes a imgbb.com y devuelve la display_url pública.
+        Requiere imgbb_api_key en config.yaml (gratis en https://api.imgbb.com/).
+        """
+        if not self._imgbb_api_key:
+            logger.warning(
+                "DiscordApprover: sin imgbb_api_key — imagen no se puede subir a imgbb. "
+                "Configura 'instagram.imgbb_api_key' en config.yaml"
+            )
+            return None
+        try:
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.imgbb.com/1/upload",
+                    data={"key": self._imgbb_api_key, "image": b64},
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("success"):
+                        url = data["data"]["display_url"]
+                        logger.debug(f"DiscordApprover: imagen subida a imgbb → {url}")
+                        return url
+                    logger.error(f"DiscordApprover: imgbb error: {data}")
+        except Exception as e:
+            logger.error(f"DiscordApprover: imgbb upload exception: {e}")
+        return None
+
     async def _fetch_channel_id(self, webhook_url: str) -> Optional[int]:
         try:
             async with aiohttp.ClientSession() as session:
@@ -1152,3 +1222,6 @@ async def _post_webhook(url: str, payload: dict) -> None:
             if resp.status not in (200, 204):
                 text = await resp.text()
                 raise RuntimeError(f"Webhook HTTP {resp.status}: {text[:200]}")
+
+
+

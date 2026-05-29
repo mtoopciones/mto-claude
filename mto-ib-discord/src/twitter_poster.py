@@ -109,6 +109,10 @@ class TwitterPoster:
         access_token:        str,
         access_token_secret: str,
     ):
+        self._api_key             = api_key
+        self._api_secret          = api_secret
+        self._access_token        = access_token
+        self._access_token_secret = access_token_secret
         self._client: Optional[tweepy.Client] = None
         if not TWEEPY_OK:
             return
@@ -175,6 +179,70 @@ class TwitterPoster:
                 if i == 0:
                     return False   # primer tweet fallido → abortar
 
+        return success > 0
+
+    async def post_thread_with_media(self, parts: List[str], image_bytes: bytes) -> bool:
+        """
+        Publica un hilo de tweets con imagen adjunta al primer tweet.
+        Usa tweepy v1.1 API para subir el media y la API v2 para publicar los tweets.
+        Si el upload de media falla, cae back a post_thread() sin imagen.
+        """
+        if not self._client or not TWEEPY_OK:
+            logger.warning("TwitterPoster: cliente no disponible")
+            return False
+
+        loop = asyncio.get_event_loop()
+        media_id: Optional[str] = None
+
+        # Intentar subir la imagen con la API v1.1
+        try:
+            auth = tweepy.OAuth1UserHandler(
+                consumer_key=self._api_key,
+                consumer_secret=self._api_secret,
+                access_token=self._access_token,
+                access_token_secret=self._access_token_secret,
+            )
+            api_v1 = tweepy.API(auth)
+
+            import io as _io
+            media = await loop.run_in_executor(
+                None,
+                lambda: api_v1.media_upload(filename="trade.png", file=_io.BytesIO(image_bytes)),
+            )
+            media_id = str(media.media_id)
+            logger.info(f"TwitterPoster: imagen subida → media_id={media_id}")
+        except Exception as e:
+            logger.warning(f"TwitterPoster: no se pudo subir imagen para media tweet — {e}. Usando solo texto.")
+            return await self.post_thread(parts)
+
+        # Publicar primer tweet con la imagen
+        prev_id: Optional[str] = None
+        success = 0
+        for i, text in enumerate(parts):
+            if len(text) > 280:
+                text = text[:277] + "…"
+            try:
+                kwargs: dict = {"text": text}
+                if i == 0 and media_id:
+                    kwargs["media_ids"] = [media_id]
+                if prev_id:
+                    kwargs["in_reply_to_tweet_id"] = prev_id
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda k=kwargs: self._client.create_tweet(**k),
+                )
+                prev_id = resp.data["id"] if resp.data else None
+                success += 1
+                logger.info(
+                    f"TwitterPoster: tweet {i+1}/{len(parts)} con media publicado "
+                    f"(id={prev_id}): {text[:60]}…"
+                )
+                if i < len(parts) - 1:
+                    await asyncio.sleep(1.5)
+            except Exception as e:
+                logger.error(f"TwitterPoster: error en tweet {i+1}/{len(parts)} (media): {e}")
+                if i == 0:
+                    return False
         return success > 0
 
     def is_ready(self) -> bool:

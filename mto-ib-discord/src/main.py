@@ -22,6 +22,7 @@ from .fill_collector import FillCollector, _fills_to_legs
 from .strategy import classify, Leg, StrategyInfo
 from .metrics import calculate as calc_metrics, TradeMetrics
 from .discord import send_trade, send_roll
+from . import card_generator
 from .log_discord import LogChannel
 from .daily_reporter import DailyReporter
 from .weekly_analyst import WeeklyAnalyst
@@ -614,12 +615,24 @@ async def _publish_trade(
             f"{icon} **{strategy.short_name}  {strategy.underlying}**  ·  "
             f"{account_info['name']}  —  lista para publicar"
         )
-        asyncio.ensure_future(approver.post_for_review(
-            embeds=[embed],
-            report_type="operacion",
-            publish_webhook=social_wh,
-            header=header,
-        ))
+        card_bytes = card_generator.generate(
+            strategy, metrics, event_type, logo_url, account_info["name"], with_qr=False
+        )
+        social_card_bytes = card_generator.generate(
+            strategy, metrics, event_type, logo_url, account_info["name"], with_qr=True
+        )
+        async def _post_trade_review() -> None:
+            target_ch = await approver._fetch_channel_id(account_info["discord_webhook"])
+            await approver.post_for_review(
+                embeds=[embed],
+                report_type="operacion",
+                publish_webhook=social_wh,
+                header=header,
+                target_channel_id=target_ch,
+                card_image_bytes=card_bytes,
+                social_image_bytes=social_card_bytes,
+            )
+        asyncio.ensure_future(_post_trade_review())
 
     await log_channel.send_trade_confirmation(
         account_name=account_info["name"],
@@ -765,12 +778,21 @@ async def _publish_roll(
             f"🔄 **ROLL  {open_strategy.underlying}**  ·  "
             f"{account_info['name']}  —  lista para publicar"
         )
-        asyncio.ensure_future(approver.post_for_review(
-            embeds=[close_embed, open_embed],
-            report_type="operacion",
-            publish_webhook=social_wh,
-            header=header,
-        ))
+        from . import card_generator as _cg_roll
+        social_roll_bytes = _cg_roll.generate(
+            open_strategy, open_metrics, TradeEvent.OPEN, logo_url, account_info["name"], with_qr=True
+        )
+        async def _post_roll_review() -> None:
+            target_ch = await approver._fetch_channel_id(account_info["discord_webhook"])
+            await approver.post_for_review(
+                embeds=[close_embed, open_embed],
+                report_type="operacion",
+                publish_webhook=social_wh,
+                header=header,
+                target_channel_id=target_ch,
+                social_image_bytes=social_roll_bytes,
+            )
+        asyncio.ensure_future(_post_roll_review())
 
     await log_channel.send_trade_confirmation(
         account_name=account_info["name"],
