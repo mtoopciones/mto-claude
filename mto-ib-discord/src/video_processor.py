@@ -56,6 +56,7 @@ async def download_video(video_id: str, output_path: str) -> bool:
         "--format", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
         "--merge-output-format", "mp4",
         "--output", output_path,
+        "--remote-components", "ejs:github",   # solver para n-challenge de YouTube
         "--no-warnings",
         "--quiet",
     ]
