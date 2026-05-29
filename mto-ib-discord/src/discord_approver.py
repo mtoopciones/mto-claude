@@ -975,7 +975,7 @@ class DiscordApprover:
                 self._learnings[report_type] = bucket[-100:]
             self._save_learnings()
 
-            # Log de cambios
+            # Log de cambios en archivo
             log_lines = [
                 f"TIPO: {report_type} | {len(lessons)} lección(es) aprendida(s)",
                 f"RESUMEN: {summary}",
@@ -987,8 +987,79 @@ class DiscordApprover:
                 f"para '{report_type}' — {summary[:100]}"
             )
 
+            # ── Notificación al canal de log ──────────────────────────
+            if self.log_webhook and lessons:
+                await self._notify_learning(report_type, summary, lessons)
+
         except Exception as e:
             logger.error(f"Approver learnings: error analizando edición — {e}")
+
+    async def _notify_learning(
+        self, report_type: str, summary: str, lessons: list
+    ) -> None:
+        """Envía al canal log-bot un embed explicando qué detectó y qué mejora aplicará."""
+        _TYPE_EMOJI = {
+            "style":    "🎨",
+            "data":     "📊",
+            "removal":  "🗑️",
+            "addition": "➕",
+            "general":  "💡",
+        }
+        _TYPE_LABEL = {
+            "style":    "Estilo / tono",
+            "data":     "Datos / cifras",
+            "removal":  "Contenido eliminado",
+            "addition": "Contenido añadido",
+            "general":  "General",
+        }
+
+        total_prev = sum(
+            len(v) for v in self._learnings.values()
+        )
+
+        # Agrupar lecciones por tipo
+        by_type: dict = {}
+        for l in lessons:
+            t = l.get("type", "general")
+            by_type.setdefault(t, []).append(l.get("lesson", ""))
+
+        fields = []
+        for t, items in by_type.items():
+            emoji = _TYPE_EMOJI.get(t, "💡")
+            label = _TYPE_LABEL.get(t, t.capitalize())
+            value = "\n".join(f"• {i}" for i in items)[:1020]
+            fields.append({"name": f"{emoji} {label}", "value": value, "inline": False})
+
+        fields.append({
+            "name": "📚 Lecciones acumuladas",
+            "value": f"`{total_prev}` lecciones guardadas para publicaciones futuras de tipo `{report_type}`",
+            "inline": False,
+        })
+
+        embed = {
+            "title": f"🧠 Aprendizaje editorial — `{report_type}`",
+            "description": (
+                f"**He detectado {len(lessons)} cambio(s) en tu edición** y los he guardado "
+                f"como reglas que aplicaré automáticamente en próximas publicaciones.\n\n"
+                f"**Resumen:** {summary}"
+            ),
+            "color": 0x9B59B6,
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "footer": {"text": "MTO Bot · aprendizaje editorial automático"},
+        }
+
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    self.log_webhook,
+                    json={"embeds": [embed]},
+                ) as resp:
+                    if resp.status not in (200, 204):
+                        text = await resp.text()
+                        logger.warning(f"Approver learning notify: HTTP {resp.status}: {text[:100]}")
+        except Exception as e:
+            logger.warning(f"Approver learning notify: error — {e}")
 
     # ── Regeneración con IA ────────────────────────────────────────
 
