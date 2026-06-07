@@ -123,12 +123,12 @@ def _right_es(put_call: str) -> str:
 
 
 def _strategy(buy_sell: str, put_call: str) -> str:
-    """Nombre corto de estrategia para una sola pata de opción."""
+    """Nombre completo de estrategia para una sola pata de opción."""
     bs = (buy_sell or "").upper()
     pc = (put_call or "").upper()
     if bs in ("SELL", "SLD"):
-        return "SP" if pc == "P" else ("SC" if pc == "C" else "STO")
-    return "LP" if pc == "P" else ("LC" if pc == "C" else "BTO")
+        return "Short Put" if pc == "P" else ("Short Call" if pc == "C" else "Venta Opción")
+    return "Long Put" if pc == "P" else ("Long Call" if pc == "C" else "Compra Opción")
 
 
 def _opt_key(acct: str, sym: str, pc: str, strike: float, exp) -> tuple:
@@ -572,6 +572,9 @@ class FlexLogbookExporter:
                     "Ep": "Expirada", "Exp": "Expirada",
                 }
                 estado = eae_map.get(eae) or estado_map.get(oc, "Cerrada")
+                # Cierre a precio 0 sin ser EAE → la opción expiró sin valor
+                if estado == "Cerrada" and (t.get("price") or 0) == 0:
+                    estado = "Expirada"
 
                 remaining = t["qty"]
                 while remaining > 0 and open_lots[key]:
