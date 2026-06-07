@@ -136,6 +136,22 @@ def _opt_key(acct: str, sym: str, pc: str, strike: float, exp) -> tuple:
     return (acct, sym.upper(), (pc or "").upper(), round(strike or 0.0, 4), exp_s)
 
 
+import re as _re
+_OCC_RE = _re.compile(r'^([A-Z][A-Z0-9.]{0,9})\s+\d{6}[PC]\d', _re.IGNORECASE)
+
+def _extract_underlying(sym: str) -> str:
+    """
+    Extrae el ticker subyacente de un símbolo OCC completo.
+    Ej: 'UBER  260320C00110000' → 'UBER'
+        'SPY   260327C00663000' → 'SPY'
+    Si no es OCC, devuelve el símbolo tal cual.
+    """
+    if not sym:
+        return sym
+    m = _OCC_RE.match(sym.strip())
+    return m.group(1) if m else sym.strip()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clase principal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,9 +440,25 @@ class FlexLogbookExporter:
         asset = g("assetCategory", "")
         if asset not in ("OPT", "STK"):
             return None
+
+        # Símbolo: preferir underlyingSymbol si existe, limpiar OCC de lo contrario
+        raw_sym  = g("symbol", "")
+        under    = g("underlyingSymbol", "")
+        sym      = under if under else _extract_underlying(raw_sym)
+
+        # Fecha: intentar varios campos que IB puede usar
+        dt_str = (g("dateTime") or g("tradeDate") or
+                  g("settleDate") or g("reportDate") or "")
+        dt = _parse_dt(dt_str)
+        # Si sólo tenemos fecha sin hora (tradeDate = "YYYY-MM-DD")
+        if dt is None and dt_str:
+            dt = _parse_date(dt_str)
+            if dt:
+                dt = datetime(dt.year, dt.month, dt.day)
+
         return {
             "acct":   g("accountId", ""),
-            "sym":    g("symbol", ""),
+            "sym":    sym,
             "asset":  asset,
             "pc":     g("putCall", ""),
             "strike": _float(g("strike")),
@@ -435,7 +467,7 @@ class FlexLogbookExporter:
             "qty":    abs(_float(g("quantity"))),
             "price":  _float(g("tradePrice")),
             "comm":   abs(_float(g("ibCommission"))),
-            "dt":     _parse_dt(g("dateTime") or g("tradeDate")),
+            "dt":     dt,
             "oc":     (g("openCloseIndicator") or "O").upper(),
             "pnl":    _float(g("fifoPnlRealized")),
             "mult":   _float(g("multiplier")) or 100.0,
@@ -450,9 +482,12 @@ class FlexLogbookExporter:
         # Mapear type a openCloseIndicator equivalente
         oc_map = {"Ex": "EX", "As": "A", "Ep": "EP", "Exp": "EP"}
         qty   = _float(g("quantity"))
+        raw_sym = g("symbol", "")
+        under   = g("underlyingSymbol", "")
+        sym     = under if under else _extract_underlying(raw_sym)
         return {
             "acct":   g("accountId", ""),
-            "sym":    g("symbol", ""),
+            "sym":    sym,
             "asset":  "OPT",
             "pc":     g("putCall", ""),
             "strike": _float(g("strike")),
@@ -471,9 +506,12 @@ class FlexLogbookExporter:
 
     def _parse_open_pos(self, e) -> Optional[dict]:
         g = e.get
+        raw_sym = g("symbol", "")
+        under   = g("underlyingSymbol", "")
+        sym     = under if under else _extract_underlying(raw_sym)
         return {
             "acct":      g("accountId", ""),
-            "sym":       g("symbol", ""),
+            "sym":       sym,
             "asset":     g("assetCategory", ""),
             "pc":        g("putCall", ""),
             "strike":    _float(g("strike")),
