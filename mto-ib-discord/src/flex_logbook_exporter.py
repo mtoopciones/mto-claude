@@ -669,7 +669,7 @@ class FlexLogbookExporter:
                     "dt_open":     lot["dt"],
                     "dt_close":    None,
                     "action_close":None,
-                    "price_close": pos.get("mark"),
+                    "price_close": None,   # sin datos de cierre para posición abierta
                     "comm_close":  None,
                     "pnl_bruto":   pos.get("unreal_pnl"),
                     "pnl_neto":    pos.get("unreal_pnl"),
