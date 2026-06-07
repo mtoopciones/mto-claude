@@ -163,6 +163,86 @@ class FlexLogbookExporter:
 
     # ── Punto de entrada ──────────────────────────────────────────
 
+    async def get_today_trades(self, target_date: date = None) -> Optional[dict]:
+        """
+        Obtiene los trades de hoy directamente de IB Flex Query.
+        Usado por el informe de cierre de mercado para mostrar:
+          - Aperturas del día con detalle (sym, estrategia, strike, vencimiento, prima)
+          - Cierres del día con detalle (sym, estrategia, strike, vencimiento, P&L)
+          - Prima neta cobrada real
+          - P&L total de cierres
+
+        Retorna None si la Flex Query falla (el daily_reporter usa el fallback).
+        """
+        if target_date is None:
+            target_date = date.today()
+
+        try:
+            xml_data = await self._fetch_flex_xml()
+            if not xml_data:
+                return None
+
+            opt_trades, _, open_positions = self._parse_xml(xml_data)
+
+            # Filtrar trades del día
+            today_trades = [
+                t for t in opt_trades
+                if t.get("dt") and t["dt"].date() == target_date
+            ]
+            if not today_trades:
+                logger.info(f"Flex Query: sin trades de opciones para {target_date}")
+                return {"opens": [], "closes": [], "prima_neta": 0.0, "pnl_cierres": 0.0}
+
+            opens_raw  = [t for t in today_trades if t["oc"] == "O"]
+            closes_raw = [t for t in today_trades if t["oc"] not in ("O",)]
+
+            # Prima neta: suma neta de primas (créditos - débitos - comisiones)
+            prima_neta = 0.0
+            for t in opens_raw:
+                mult = t.get("mult", 100.0)
+                if t["bs"].upper() in ("SELL", "SLD"):
+                    prima_neta += t["price"] * t["qty"] * mult - t["comm"]
+                else:
+                    prima_neta -= t["price"] * t["qty"] * mult + t["comm"]
+
+            # Para P&L de cierres usar las filas emparejadas (FIFO)
+            opt_rows    = self._build_option_rows(opt_trades, open_positions)
+            close_rows  = [
+                r for r in opt_rows
+                if r.get("estado") != "Abierta"
+                and r.get("dt_close")
+                and (r["dt_close"].date() if isinstance(r["dt_close"], datetime) else r["dt_close"]) == target_date
+            ]
+            open_rows   = [
+                r for r in opt_rows
+                if r.get("estado") == "Abierta"
+                and r.get("dt_open")
+                and (r["dt_open"].date() if isinstance(r["dt_open"], datetime) else r["dt_open"]) == target_date
+            ]
+
+            # Rellenar account_name en open_rows si falta
+            for r in open_rows + close_rows:
+                if not r.get("acct_name") and r.get("_acct_id"):
+                    r["acct_name"] = self.account_names.get(r["_acct_id"], r["_acct_id"])
+
+            pnl_cierres = sum((r.get("pnl_neto") or 0.0) for r in close_rows)
+
+            logger.info(
+                f"Flex Query ({target_date}): "
+                f"{len(open_rows)} aperturas, {len(close_rows)} cierres, "
+                f"prima neta {prima_neta:+.2f}, P&L {pnl_cierres:+.2f}"
+            )
+            return {
+                "opens":       open_rows,
+                "closes":      close_rows,
+                "prima_neta":  round(prima_neta, 2),
+                "pnl_cierres": round(pnl_cierres, 2),
+            }
+
+        except Exception as e:
+            logger.error(f"Flex Query get_today_trades: {e}")
+            return None
+
     async def export_and_publish(self, discord_webhook: str = "") -> None:
         """Exporta el Excel desde Flex Query y lo publica en Discord."""
         if not OPENPYXL_OK:
@@ -558,6 +638,17 @@ class FlexLogbookExporter:
                     "notional":    notional,
                 })
 
+        # Filtrar filas fantasma: cierres de OptionEAE sin apertura conocida y Strike=0
+        # (surgen cuando la apertura fue antes del rango de la Flex Query y el cierre es EAE)
+        rows = [
+            r for r in rows
+            if not (
+                r.get("action_open") == "—"
+                and (r.get("strike") or 0) == 0
+                and r.get("price_open") is None
+            )
+        ]
+
         # Ordenar: abiertas primero, luego por fecha apertura
         rows.sort(key=lambda r: (
             0 if r["estado"] == "Abierta" else 1,
@@ -863,177 +954,205 @@ class FlexLogbookExporter:
         opt_rows: List[dict],
         stk_rows: List[dict],
     ) -> None:
-        fecha_gen = datetime.now(_MADRID).strftime("%d/%m/%Y %H:%M")
+        """
+        Resumen con el mismo formato que el Log_book anterior:
+          - Tabla 1: "Beneficio realizado" — P&L neto por cuenta y mes (operaciones cerradas)
+          - Tabla 2: "Efectivo cobrado"    — Prima neta de posiciones abiertas por cuenta y mes
+        Columnas: [nombre] | Total | mes_N | mes_N-1 | … | mes_1 | Acumulado
+        """
+        # ── Mapeo de nombre largo → nombre corto para el resumen ─────
+        _DISPLAY = {
+            "MTO Cuenta 10K":        "10 k",
+            "MTO Cuenta 50k":        "50 k",
+            "MTO Dividendos ETF 5K": "Dividendos - ETF",
+        }
+        _ACCT_ORDER = ["10 k", "50 k", "Dividendos - ETF", "Op. Sueltas"]
+        N_COLS = 5   # meses individuales a mostrar; el resto va a "Acumulado"
 
-        # ── Título ────────────────────────────────────────────────
-        ws.merge_cells("A1:H1")
-        c = ws["A1"]
-        c.value     = f"RESUMEN MTO OPCIONES  —  {fecha_gen} (Madrid)"
-        c.font      = Font(bold=True, size=14, color="FFFFFF")
-        c.fill      = PatternFill("solid", fgColor=_C_HEADER)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 32
+        def _display(name: str) -> str:
+            return _DISPLAY.get(name, "Op. Sueltas")
 
-        # ── Sección P&L mensual ───────────────────────────────────
-        r = 3
-        ws.merge_cells(f"A{r}:H{r}")
-        c = ws.cell(row=r, column=1, value="📈  P&L MENSUAL")
-        c.font  = Font(bold=True, size=12, color="FFFFFF")
-        c.fill  = PatternFill("solid", fgColor=_C_SUBHDR)
-        c.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[r].height = 24
-        r += 1
+        def _month_key(dt) -> str:
+            if isinstance(dt, datetime):
+                return dt.strftime("%Y-%m")
+            if isinstance(dt, date):
+                return dt.strftime("%Y-%m")
+            return str(dt)[:7] if dt else ""
 
-        pnl_hdr = [
-            "Mes", "P&L Opciones", "P&L Acciones", "P&L Total",
-            "Comis. Opciones", "Comis. Acciones", "Comis. Total", "Neto Final",
-        ]
-        for col, h in enumerate(pnl_hdr, 1):
-            c = ws.cell(row=r, column=col, value=h)
-            c.font      = Font(bold=True, size=10, color="FFFFFF")
-            c.fill      = PatternFill("solid", fgColor=_C_DARK2)
-            c.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[r].height = 20
-        r += 1
+        def _month_label(key: str) -> str:
+            try:
+                yr, mo = int(key[:4]), int(key[5:7])
+                return f"{_MESES[mo].lower()}-{str(yr)[2:]}"
+            except Exception:
+                return key
 
-        monthly = self._monthly_pnl(opt_rows, stk_rows)
-        for mes, d in sorted(monthly.items()):
-            total_pnl  = d["opt_pnl"]  + d["stk_pnl"]
-            total_comm = d["opt_comm"] + d["stk_comm"]
-            neto       = total_pnl - total_comm
-            row_vals   = [mes, d["opt_pnl"], d["stk_pnl"], total_pnl,
-                          d["opt_comm"], d["stk_comm"], total_comm, neto]
-            pos        = total_pnl >= 0
-            row_bg     = _C_PROFIT if pos else _C_LOSS
-            for col, val in enumerate(row_vals, 1):
-                c = ws.cell(row=r, column=col, value=val)
-                c.fill      = PatternFill("solid", fgColor=row_bg if col >= 2 else _C_ALT)
-                c.alignment = Alignment(horizontal="center" if col > 1 else "left")
-                c.font      = Font(size=10, bold=(col in (4, 8)))
-                if col > 1 and isinstance(val, (int, float)):
-                    c.number_format = "#,##0.00"
-            r += 1
+        # ── 1. Calcular beneficio_realizado: P&L neto de cierres ─────
+        # {(display_name, month_key): pnl_neto}
+        ben: Dict[tuple, float] = defaultdict(float)
+        all_months_ben: set = set()
 
-        # Fila de totales
-        tot_opt_pnl  = sum(v["opt_pnl"]  for v in monthly.values())
-        tot_stk_pnl  = sum(v["stk_pnl"]  for v in monthly.values())
-        tot_opt_comm = sum(v["opt_comm"] for v in monthly.values())
-        tot_stk_comm = sum(v["stk_comm"] for v in monthly.values())
-        tot_pnl      = tot_opt_pnl + tot_stk_pnl
-        tot_comm     = tot_opt_comm + tot_stk_comm
-        tot_neto     = tot_pnl - tot_comm
-        for col, val in enumerate(
-            ["TOTAL", tot_opt_pnl, tot_stk_pnl, tot_pnl,
-             tot_opt_comm, tot_stk_comm, tot_comm, tot_neto], 1
-        ):
-            c = ws.cell(row=r, column=col, value=val)
-            c.font      = Font(bold=True, size=10, color="FFFFFF")
-            c.fill      = PatternFill("solid", fgColor=_C_TOTAL)
-            c.alignment = Alignment(horizontal="center" if col > 1 else "left")
-            if col > 1 and isinstance(val, (int, float)):
-                c.number_format = "#,##0.00"
-        r += 2
+        for r in opt_rows + stk_rows:
+            if r.get("estado") == "Abierta":
+                continue
+            pnl = (r.get("pnl_bruto") or 0.0) - (r.get("comm_open") or 0.0) - (r.get("comm_close") or 0.0)
+            dt  = r.get("dt_close") or r.get("dt_open")
+            mk  = _month_key(dt)
+            if not mk:
+                continue
+            dn = _display(r.get("acct_name", ""))
+            ben[(dn, mk)] += pnl
+            all_months_ben.add(mk)
 
-        # ── Sección saldo inmovilizado ────────────────────────────
-        ws.merge_cells(f"A{r}:H{r}")
-        c = ws.cell(row=r, column=1, value="🔒  SALDO INMOVILIZADO (POSICIONES ABIERTAS)")
-        c.font  = Font(bold=True, size=12, color="FFFFFF")
-        c.fill  = PatternFill("solid", fgColor=_C_SUBHDR)
-        c.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[r].height = 24
-        r += 1
-
-        sal_hdr = ["Cuenta", "Ticker", "P/C", "Strike",
-                   "Vencimiento", "Contratos", "Notional (USD)", "Acción"]
-        for col, h in enumerate(sal_hdr, 1):
-            c = ws.cell(row=r, column=col, value=h)
-            c.font      = Font(bold=True, size=10, color="FFFFFF")
-            c.fill      = PatternFill("solid", fgColor=_C_DARK2)
-            c.alignment = Alignment(horizontal="center")
-        r += 1
-
-        total_notional = 0.0
-        for idx, row in enumerate(
-            [x for x in opt_rows if x.get("estado") == "Abierta"]
-        ):
-            notional        = row.get("notional") or 0.0
-            total_notional += abs(notional)
-            bg              = _C_ALT if idx % 2 == 0 else _C_WHITE
-            for col, val in enumerate(
-                [row.get("acct_name", ""), row.get("sym", ""),
-                 row.get("pc", ""),        row.get("strike"),
-                 row.get("expiry"),        row.get("qty"),
-                 abs(notional),            row.get("action_open", "")], 1
-            ):
-                c = ws.cell(row=r, column=col, value=val)
-                c.fill      = PatternFill("solid", fgColor=bg)
-                c.alignment = Alignment(horizontal="center" if col > 1 else "left")
-                c.font      = Font(size=10)
-                if col == 5 and isinstance(val, (date, datetime)):
-                    c.number_format = "DD/MM/YYYY"
-                if col == 7 and isinstance(val, (int, float)):
-                    c.number_format = "#,##0.00"
-            r += 1
-
-        # Total notional
-        for col in range(1, 9):
-            c = ws.cell(row=r, column=col)
-            c.font = Font(bold=True, size=10, color="FFFFFF")
-            c.fill = PatternFill("solid", fgColor=_C_TOTAL)
-        ws.cell(row=r, column=1).value = "TOTAL INMOVILIZADO"
-        ws.cell(row=r, column=1).alignment = Alignment(horizontal="left")
-        c = ws.cell(row=r, column=7, value=total_notional)
-        c.number_format = "#,##0.00"
-        c.alignment     = Alignment(horizontal="center")
-
-        # Anchos de columna
-        for i, w in enumerate([20, 10, 8, 10, 14, 12, 16, 14], 1):
-            ws.column_dimensions[get_column_letter(i)].width = w
-
-    # ── Cálculo P&L mensual ───────────────────────────────────────
-
-    def _monthly_pnl(
-        self, opt_rows: List[dict], stk_rows: List[dict]
-    ) -> Dict[str, dict]:
-        monthly: Dict[str, dict] = {}
-
-        def _ensure(k):
-            if k not in monthly:
-                monthly[k] = {"opt_pnl": 0.0, "stk_pnl": 0.0,
-                               "opt_comm": 0.0, "stk_comm": 0.0}
+        # ── 2. Calcular efectivo_cobrado: prima neta de posiciones abiertas ──
+        # Para cada posición abierta: SELL = +prima cobrada, BUY = -prima pagada
+        efec: Dict[tuple, float] = defaultdict(float)
+        all_months_efec: set = set()
 
         for r in opt_rows:
-            if r.get("estado") == "Abierta":
+            if r.get("estado") != "Abierta":
                 continue
-            dt = r.get("dt_close") or r.get("dt_open")
-            if not dt:
+            mk = _month_key(r.get("dt_open"))
+            if not mk:
                 continue
-            k = dt.strftime("%Y-%m") if isinstance(dt, datetime) else str(dt)[:7]
-            _ensure(k)
-            monthly[k]["opt_pnl"]  += r.get("pnl_bruto") or 0.0
-            monthly[k]["opt_comm"] += (r.get("comm_open") or 0.0) + (r.get("comm_close") or 0.0)
+            dn     = _display(r.get("acct_name", ""))
+            qty    = r.get("qty") or 0
+            price  = r.get("price_open") or 0.0
+            comm   = r.get("comm_open") or 0.0
+            mult   = r.get("mult") or 100.0
+            if (r.get("action_open") or "").lower() == "venta":
+                cash = price * qty * mult - comm
+            else:
+                cash = -(price * qty * mult + comm)
+            efec[(dn, mk)] += cash
+            all_months_efec.add(mk)
 
-        for r in stk_rows:
-            if r.get("estado") == "Abierta":
-                continue
-            dt = r.get("dt_close") or r.get("dt_open")
-            if not dt:
-                continue
-            k = dt.strftime("%Y-%m") if isinstance(dt, datetime) else str(dt)[:7]
-            _ensure(k)
-            monthly[k]["stk_pnl"]  += r.get("pnl_bruto") or 0.0
-            monthly[k]["stk_comm"] += (r.get("comm_open") or 0.0) + (r.get("comm_close") or 0.0)
+        # ── Elegir columnas de meses (los N más recientes) ─────────────
+        def _pivot_cols(all_months: set):
+            sorted_months = sorted(all_months, reverse=True)
+            shown   = sorted_months[:N_COLS]   # más recientes
+            acum    = sorted_months[N_COLS:]    # más antiguos → "Acumulado"
+            return shown, acum
 
-        # Formatear clave a "Ene 25"
-        result = {}
-        for k, v in sorted(monthly.items()):
-            try:
-                yr, mo = int(k[:4]), int(k[5:7])
-                label  = f"{_MESES[mo]} {str(yr)[2:]}"
-            except Exception:
-                label = k
-            result[label] = v
-        return result
+        # ── Helper para escribir una tabla pivote ──────────────────────
+        def _write_pivot(
+            ws, start_row: int,
+            title: str, nota1: str, nota2: str,
+            data: Dict[tuple, float],
+            shown_months: list, acum_months: list,
+        ) -> int:
+            r = start_row
+            ncols = 2 + len(shown_months) + 1   # nombre + Total + meses + Acumulado
+
+            # Cabecera de sección
+            for col in range(1, ncols + 1):
+                c = ws.cell(row=r, column=col)
+                c.fill = PatternFill("solid", fgColor="D9D9D9")
+                c.font = Font(bold=True, size=10)
+                c.border = _thin_border()
+            ws.cell(row=r, column=1).value = title
+            ws.cell(row=r, column=2).value = "Total"
+            for i, mk in enumerate(shown_months):
+                ws.cell(row=r, column=3 + i).value = _month_label(mk)
+                ws.cell(row=r, column=3 + i).alignment = Alignment(horizontal="center")
+            ws.cell(row=r, column=ncols).value = "Acumulado"
+            ws.cell(row=r, column=ncols).alignment = Alignment(horizontal="center")
+            ws.cell(row=r, column=2).alignment = Alignment(horizontal="center")
+            r += 1
+
+            # Filas de cuentas
+            for acct in _ACCT_ORDER:
+                row_total = sum(v for (dn, mk), v in data.items() if dn == acct)
+                row_shown = [sum(v for (dn, mk), v in data.items()
+                                 if dn == acct and mk == m) for m in shown_months]
+                row_acum  = sum(v for (dn, mk), v in data.items()
+                                if dn == acct and mk in acum_months)
+
+                vals = [acct, row_total] + row_shown + [row_acum]
+                for col, val in enumerate(vals, 1):
+                    c = ws.cell(row=r, column=col, value=val if val != 0.0 else None)
+                    c.font      = Font(size=10)
+                    c.border    = _thin_border()
+                    c.alignment = Alignment(
+                        horizontal="left" if col == 1 else "right",
+                        vertical="center",
+                    )
+                    if col > 1 and isinstance(val, (int, float)) and val != 0.0:
+                        c.number_format = '#,##0.00'
+                        if val < 0:
+                            c.font = Font(size=10, color="CC0000")
+                r += 1
+
+            # Fila vacía
+            r += 1
+
+            # Fila total
+            total_total  = sum(data.values())
+            total_shown  = [sum(v for (dn, mk), v in data.items()
+                                if mk == m) for m in shown_months]
+            total_acum   = sum(v for (dn, mk), v in data.items()
+                               if mk in acum_months)
+            tot_vals = ["Total", total_total] + total_shown + [total_acum]
+            for col, val in enumerate(tot_vals, 1):
+                c = ws.cell(row=r, column=col, value=val if val != 0.0 else None)
+                c.font      = Font(bold=True, size=10)
+                c.fill      = PatternFill("solid", fgColor="D9D9D9")
+                c.border    = _thin_border()
+                c.alignment = Alignment(
+                    horizontal="left" if col == 1 else "right",
+                    vertical="center",
+                )
+                if col > 1 and isinstance(val, (int, float)) and val != 0.0:
+                    c.number_format = '#,##0.00'
+                    if val < 0:
+                        c.font = Font(bold=True, size=10, color="CC0000")
+            r += 1
+
+            # Notas
+            for nota in (nota1, nota2):
+                ws.cell(row=r, column=1).value = nota
+                ws.cell(row=r, column=1).font  = Font(size=8, italic=True, color="666666")
+                ws.merge_cells(f"A{r}:{get_column_letter(ncols)}{r}")
+                r += 1
+
+            return r + 1   # espacio entre tablas
+
+        # ── Thin border helper ─────────────────────────────────────────
+        from openpyxl.styles import Border, Side
+
+        def _thin_border():
+            s = Side(style="thin", color="CCCCCC")
+            return Border(left=s, right=s, top=s, bottom=s)
+
+        # ── Calcular columnas para cada tabla ──────────────────────────
+        shown_ben,  acum_ben  = _pivot_cols(all_months_ben)
+        shown_efec, acum_efec = _pivot_cols(all_months_efec or all_months_ben)
+
+        # ── Escribir las dos tablas ────────────────────────────────────
+        next_row = _write_pivot(
+            ws, start_row=1,
+            title="Beneficio realizado *",
+            nota1="* Importe correspondiente a operaciones cerradas, la fecha del beneficio se computa en la fecha de cierre.",
+            nota2="* El valor de estos saldos solo se puede modificar por el mes en curso, a mes cerrado es invariable.",
+            data=ben,
+            shown_months=shown_ben,
+            acum_months=acum_ben,
+        )
+
+        _write_pivot(
+            ws, start_row=next_row,
+            title="Efectivo cobrado *",
+            nota1="* Efectivo de primas cobradas de operaciones no cerradas, a medida que se cierran operaciones, este valor tiende a cero.",
+            nota2="* El valor de los meses cerrados se modifica en tanto se van cerrando operaciones, siempre debe tender a cero.",
+            data=efec,
+            shown_months=shown_efec,
+            acum_months=acum_efec,
+        )
+
+        # Anchos de columna
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 14
+        for i in range(3, 3 + N_COLS + 1):
+            ws.column_dimensions[get_column_letter(i)].width = 13
 
     # ── Helpers de estilo ─────────────────────────────────────────
 
@@ -1139,10 +1258,7 @@ class FlexLogbookExporter:
 
         content = (
             f"📊 **EXCEL OPERACIONES  —  {fecha}**\n"
-            f"Fuente: IB Flex Query · "
-            f"{n_open} opciones abiertas · "
-            f"{n_closed} opciones cerradas/expiradas · "
-            f"{n_stk} trades acciones"
+            f"Log_book completo con todos los valores actualizados."
         )
 
         boundary = "DiscordFileBoundary7MA4YW"
