@@ -21,12 +21,15 @@ from .position_tracker import PositionTracker, TradeEvent
 from .fill_collector import FillCollector, _fills_to_legs
 from .strategy import classify, Leg, StrategyInfo
 from .metrics import calculate as calc_metrics, TradeMetrics
-from .discord import send_trade, send_roll
+from .discord import send_trade, send_roll, _post_image as _post_image_raw
 from . import card_generator
 from .log_discord import LogChannel
 from .daily_reporter import DailyReporter
 from .weekly_analyst import WeeklyAnalyst
 from .stripe_onboarding import StripeOnboarding
+from .comerciales_reporter import build_from_config as _build_comerciales
+from .coupon_tracker import build_from_config as _build_coupon_tracker
+from .mention_responder import MentionResponder
 from .pnl_tracker import PnlTracker
 from .portfolio_tracker import PortfolioTracker
 from .logbook_updater import LogbookUpdater
@@ -35,6 +38,7 @@ from .instagram_poster import build_from_config as _build_instagram
 from .twitter_poster import build_from_config as _build_twitter
 from .health_reporter import HealthReporter
 from .discord_approver import DiscordApprover
+from .flex_logbook_exporter import build_from_config as _build_flex_logbook
 
 
 # ─────────────────────────────────────────────────────────────
@@ -60,6 +64,49 @@ approver = None
 ROLL_WINDOW = 60  # segundos para detectar roll
 _pending_close: Dict[tuple, dict] = {}  # {(account, symbol, right): {...}}
 _seen_exec_ids: set = set()            # IDs ya procesados (evita duplicados en polling)
+_private_channel_ids: Dict[str, Optional[int]] = {}  # discord_webhook → channel_id (caché)
+_SEEN_IDS_FILE = "data/seen_exec_ids.json"
+
+
+def _load_seen_exec_ids() -> None:
+    """Carga los exec IDs procesados desde disco (persiste entre reinicios)."""
+    global _seen_exec_ids
+    try:
+        if os.path.exists(_SEEN_IDS_FILE):
+            with open(_SEEN_IDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Solo cargar IDs del día de hoy para no acumular indefinidamente
+            from zoneinfo import ZoneInfo as _ZI
+            today = datetime.now(_ZI("America/New_York")).strftime("%Y%m%d")
+            ids_today = set(data.get(today, []))
+            _seen_exec_ids.update(ids_today)
+            if ids_today:
+                logger.info(f"seen_exec_ids: {len(ids_today)} IDs cargados del día de hoy")
+    except Exception as e:
+        logger.warning(f"No se pudo cargar seen_exec_ids: {e}")
+
+
+def _save_seen_exec_ids() -> None:
+    """Guarda los exec IDs del día actual en disco."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        today = datetime.now(_ZI("America/New_York")).strftime("%Y%m%d")
+        # Cargar archivo existente para preservar días anteriores si existen
+        existing = {}
+        if os.path.exists(_SEEN_IDS_FILE):
+            with open(_SEEN_IDS_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        existing[today] = list(_seen_exec_ids)
+        # Mantener solo los últimos 2 días
+        keys = sorted(existing.keys())
+        if len(keys) > 2:
+            for old_key in keys[:-2]:
+                del existing[old_key]
+        os.makedirs(os.path.dirname(_SEEN_IDS_FILE), exist_ok=True)
+        with open(_SEEN_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar seen_exec_ids: {e}")
 
 # Primas de apertura por posición — persisten entre reinicios para mostrar en tarjeta de cierre
 _open_premiums: Dict[str, float] = {}
@@ -119,6 +166,18 @@ async def on_connected(ib: IB) -> None:
 
     # Arrancar polling de respaldo (detecta fills no recibidos por evento)
     asyncio.ensure_future(_poll_fills_loop())
+
+    # Pre-resolver channel IDs de los canales privados de cada cuenta
+    if approver:
+        for acc in cfg.get("accounts", []):
+            wh = acc.get("discord_webhook", "")
+            if wh and wh not in _private_channel_ids:
+                ch_id = await approver._fetch_channel_id(wh)
+                _private_channel_ids[wh] = ch_id
+                if ch_id:
+                    logger.info(f"  → Canal privado {acc['name']}: channel_id={ch_id} (cacheado)")
+                else:
+                    logger.warning(f"  → Canal privado {acc['name']}: no se pudo resolver channel_id — revisa que el bot tiene permisos en el canal Automatización")
 
     # Notificar cuentas activas
     accounts = [acc["name"] for acc in cfg.get("accounts", [])]
@@ -192,10 +251,13 @@ async def _recover_recent_fills(ib: IB) -> None:
             logger.info("No hay fills de hoy")
             return
 
-        # Agrupar por (account, orderId) y ordenar cronológicamente
+        # Agrupar por (account, orderId) y ordenar cronológicamente.
+        # Sub-agrupar por símbolo: evita que dos órdenes distintas con el mismo
+        # orderId (puede ocurrir en IB tras reconexión) se mezclen como un spread.
         orders: dict = {}
         for fill in today_fills:
-            key = (fill.execution.acctNumber, fill.execution.orderId)
+            sym = fill.contract.symbol if fill.contract else ""
+            key = (fill.execution.acctNumber, fill.execution.orderId, sym)
             orders.setdefault(key, []).append(fill)
 
         def _order_time(order_fills):
@@ -238,14 +300,25 @@ async def _recover_recent_fills(ib: IB) -> None:
             t        = order_fills[0].time
             order_dt = t.replace(tzinfo=None) if t else datetime.min
 
+            # Comprobar si esta orden ya fue procesada (exec IDs en disco)
+            already_seen = all(
+                (f.execution and f.execution.execId in _seen_exec_ids)
+                for f in order_fills if f.execution
+            )
+
             if order_dt > cutoff_30m:
-                # Reciente: publicar en Discord (process_order actualiza posición)
-                await process_order(legs)
-                recent_count += 1
+                if already_seen:
+                    # Ya publicado en una sesión anterior — solo actualizar posición
+                    _update_position_from_legs(legs)
+                    history_count += 1
+                else:
+                    # Reciente y nuevo: publicar en Discord
+                    await process_order(legs)
+                    recent_count += 1
             else:
                 # Histórico: solo registrar en daily reporter y actualizar posición
                 await _record_in_reporter(legs)
-                _update_position_from_legs(legs)   # necesario para fills siguientes
+                _update_position_from_legs(legs)
                 history_count += 1
 
             # Marcar todos los execIds como procesados
@@ -253,6 +326,7 @@ async def _recover_recent_fills(ib: IB) -> None:
                 if f.execution and f.execution.execId:
                     _seen_exec_ids.add(f.execution.execId)
 
+        _save_seen_exec_ids()   # persistir tras recovery
         logger.info(
             f"Recuperación: {recent_count} órdenes publicadas en Discord, "
             f"{history_count} registradas solo en daily reporter"
@@ -353,6 +427,7 @@ def on_fill(trade, fill: Fill) -> None:
         # Marcar como procesado para que el polling de respaldo no lo reprocese
         if exec_id:
             _seen_exec_ids.add(exec_id)
+            _save_seen_exec_ids()
     except Exception as e:
         logger.error(f"on_fill error: {e}")
 
@@ -380,7 +455,8 @@ async def _poll_fills_loop() -> None:
             now    = datetime.now()
             cutoff = now - LOOKBACK
 
-            # Agrupar por (account, orderId)
+            # Agrupar por (account, orderId, symbol) — el símbolo evita mezclar
+            # tickers distintos que IB a veces asigna al mismo orderId
             orders: dict = {}
             for f in fills:
                 exec_id = f.execution.execId if f.execution else None
@@ -388,10 +464,10 @@ async def _poll_fills_loop() -> None:
                     continue
                 t = f.time.replace(tzinfo=None) if f.time else datetime.min
                 if t < cutoff:
-                    # Demasiado antiguo — marcamos como visto sin publicar
                     _seen_exec_ids.add(exec_id)
                     continue
-                key = (f.execution.acctNumber, f.execution.orderId)
+                sym = f.contract.symbol if f.contract else ""
+                key = (f.execution.acctNumber, f.execution.orderId, sym)
                 orders.setdefault(key, []).append(f)
 
             if orders:
@@ -404,6 +480,7 @@ async def _poll_fills_loop() -> None:
                     for f in order_fills:
                         if f.execution and f.execution.execId:
                             _seen_exec_ids.add(f.execution.execId)
+                _save_seen_exec_ids()
 
         except Exception as e:
             logger.error(f"Poll fills loop error: {e}")
@@ -411,10 +488,57 @@ async def _poll_fills_loop() -> None:
         await asyncio.sleep(POLL_INTERVAL)
 
 
+# Caché de nombres de empresa por símbolo (persiste en memoria durante la sesión)
+_company_name_cache: Dict[str, str] = {}
+
+
+async def _enrich_company_names(legs: List[Leg]) -> None:
+    """
+    Rellena company_name en cada Leg.
+    - Primero usa la caché en memoria (de sesiones anteriores).
+    - Si no está en caché, hace una sola llamada reqContractDetails por símbolo
+      nuevo, con timeout corto para no bloquear el flujo principal.
+    """
+    if not ib_ref or not ib_ref.isConnected():
+        return
+
+    symbols_to_fetch = set()
+    for leg in legs:
+        sym = leg.symbol
+        if not leg.company_name and sym not in _company_name_cache:
+            symbols_to_fetch.add(sym)
+
+    for sym in symbols_to_fetch:
+        try:
+            from ib_insync import Stock
+            contract = Stock(sym, "SMART", "USD")
+            details = await asyncio.wait_for(
+                ib_ref.reqContractDetailsAsync(contract), timeout=4
+            )
+            if details:
+                # longName puede estar en ContractDetails o en el contrato interno
+                name = (getattr(details[0], "longName", "") or
+                        getattr(details[0].contract, "longName", "") or "")
+                _company_name_cache[sym] = name.strip().upper()
+            else:
+                _company_name_cache[sym] = ""
+        except Exception as e:
+            logger.debug(f"_enrich_company_names: no se pudo obtener nombre de {sym}: {e}")
+            _company_name_cache[sym] = ""
+
+    # Aplicar caché a todas las legs
+    for leg in legs:
+        if not leg.company_name and leg.symbol in _company_name_cache:
+            leg.company_name = _company_name_cache[leg.symbol]
+
+
 async def process_order(legs: List[Leg]) -> None:
     """Llamado cuando todos los fills de una orden están listos."""
     if not legs:
         return
+
+    # Enriquecer con nombre de empresa si falta
+    await _enrich_company_names(legs)
 
     account_id = legs[0].account
     account_info = account_map.get(account_id)
@@ -487,16 +611,40 @@ async def process_order(legs: List[Leg]) -> None:
     )
     open_prem: Optional[float] = None
     if event_type == TradeEvent.CLOSE:
-        open_prem = _open_premiums.pop(prem_key, None)
+        stored = _open_premiums.pop(prem_key, None)
+        if isinstance(stored, dict):
+            open_prem = stored.get("premium")
+            # Restaurar nombre de estrategia original (ej: PCS → no PDS)
+            orig_name  = stored.get("strategy_name")
+            orig_short = stored.get("strategy_short")
+            if orig_name:
+                strategy.name       = orig_name
+                strategy.short_name = orig_short or strategy.short_name
+                logger.info(f"  → Nombre estrategia restaurado desde apertura: {orig_short} / {orig_name}")
+        else:
+            open_prem = stored  # compatibilidad con entradas antiguas (solo float)
         _save_open_premiums()
     elif event_type == TradeEvent.PARTIAL_CLOSE:
-        open_prem = _open_premiums.get(prem_key)  # no borrar, posición sigue abierta
+        stored = _open_premiums.get(prem_key)
+        if isinstance(stored, dict):
+            open_prem = stored.get("premium")
+            orig_name  = stored.get("strategy_name")
+            orig_short = stored.get("strategy_short")
+            if orig_name:
+                strategy.name       = orig_name
+                strategy.short_name = orig_short or strategy.short_name
+        else:
+            open_prem = stored
 
     metrics = calc_metrics(strategy, open_premium=open_prem)
 
-    # En aperturas/incrementos: guardar la prima neta para mostrarla en el futuro cierre
+    # En aperturas/incrementos: guardar prima + nombre de estrategia para el futuro cierre
     if event_type in (TradeEvent.OPEN, TradeEvent.ADD):
-        _open_premiums[prem_key] = metrics.net_premium_after_comm
+        _open_premiums[prem_key] = {
+            "premium":        metrics.net_premium_after_comm,
+            "strategy_name":  strategy.name,
+            "strategy_short": strategy.short_name,
+        }
         _save_open_premiums()
 
     # ── Lógica de roll ────────────────────────────────────────
@@ -581,29 +729,34 @@ async def _publish_trade(
     metrics: "TradeMetrics",
     event_type: str,
 ) -> None:
-    discord_cfg = cfg.get("discord", {})
-    logo_url    = discord_cfg.get("logo_url", "")
-    webhook_url = account_info["discord_webhook"]
+    discord_cfg     = cfg.get("discord", {})
+    logo_url        = discord_cfg.get("logo_url", "")
+    public_webhook  = account_info.get("social_webhook", "")   # canal Público (Cuenta Xk)
+    private_webhook = account_info["discord_webhook"]           # canal Privado (Automatización Xk)
 
-    ok = await send_trade(
-        webhook_url=webhook_url,
-        strategy=strategy,
-        metrics=metrics,
-        event_type=event_type,
-        account_name=account_info["name"],
-        logo_url=logo_url,
-    )
-    if ok:
-        logger.info(f"  → Publicado en Discord ({account_info['name']})")
+    # ── 1. Publicar en canal PÚBLICO sin botones ──────────────
+    public_msg_id: str = ""
+    if public_webhook:
+        public_msg_id = await send_trade(
+            webhook_url=public_webhook,
+            strategy=strategy,
+            metrics=metrics,
+            event_type=event_type,
+            account_name=account_info["name"],
+            logo_url=logo_url,
+        ) or ""
+        if public_msg_id:
+            logger.info(f"  → Publicado en canal publico ({account_info['name']}) msg={public_msg_id}")
+        else:
+            await log_channel.send_error(
+                f"No se pudo publicar en canal publico: {strategy.name} {strategy.underlying} "
+                f"| {account_info['name']}"
+            )
     else:
-        await log_channel.send_error(
-            f"No se pudo publicar en Discord: {strategy.name} {strategy.underlying} "
-            f"| {account_info['name']}"
-        )
+        logger.warning(f"  → social_webhook no configurado para {account_info['name']}")
 
-    # ── Revisión con botones → social_webhook ────────────────
-    social_wh = account_info.get("social_webhook", "")
-    if social_wh and approver:
+    # ── 2. Publicar en canal PRIVADO con botones de revisión ──
+    if approver:
         from .discord import _build_apertura_embed, _build_cierre_embed
         is_open = event_type in (TradeEvent.OPEN, TradeEvent.ADD)
         icon    = "🟢" if is_open else ("🔴" if event_type == TradeEvent.CLOSE else "🟠")
@@ -615,23 +768,49 @@ async def _publish_trade(
             f"{icon} **{strategy.short_name}  {strategy.underlying}**  ·  "
             f"{account_info['name']}  —  lista para publicar"
         )
-        card_bytes = card_generator.generate(
-            strategy, metrics, event_type, logo_url, account_info["name"], with_qr=False
-        )
-        social_card_bytes = card_generator.generate(
+        # Discord (público y privado) usa embed nativo — no se generan PNG para Discord
+        # Twitter/X: tarjeta oscura con QR  →  card_bytes  →  _pending_card_images
+        # Instagram/Facebook: tarjeta clara con QR  →  social_card_bytes  →  _pending_images
+        card_bytes        = card_generator.generate(
             strategy, metrics, event_type, logo_url, account_info["name"], with_qr=True
         )
+        social_card_bytes = card_generator.generate_light(
+            strategy, metrics, event_type, logo_url, account_info["name"], with_qr=True
+        )
+        _pub_msg_id  = public_msg_id
+        _pub_webhook = public_webhook
+
         async def _post_trade_review() -> None:
-            target_ch = await approver._fetch_channel_id(account_info["discord_webhook"])
-            await approver.post_for_review(
-                embeds=[embed],
-                report_type="operacion",
-                publish_webhook=social_wh,
-                header=header,
-                target_channel_id=target_ch,
-                card_image_bytes=card_bytes,
-                social_image_bytes=social_card_bytes,
-            )
+            try:
+                # Usar caché; re-intentar fetch solo si no está en caché
+                target_ch = _private_channel_ids.get(private_webhook)
+                if target_ch is None:
+                    target_ch = await approver._fetch_channel_id(private_webhook)
+                    if target_ch:
+                        _private_channel_ids[private_webhook] = target_ch
+                    else:
+                        logger.error(
+                            f"No se pudo resolver channel_id para canal privado de "
+                            f"{account_info['name']} — el mensaje de revisión NO se publicará. "
+                            "Comprueba que el bot tiene permisos en el canal Automatización."
+                        )
+                        await log_channel.send_error(
+                            f"❌ Canal privado {account_info['name']}: channel_id no resuelto. "
+                            "Revisa permisos del bot en el canal Automatización."
+                        )
+                        return
+                await approver.post_for_review(
+                    embeds=[embed],
+                    report_type="operacion",
+                    publish_webhook=_pub_webhook,
+                    header=header,
+                    target_channel_id=target_ch,
+                    card_image_bytes=card_bytes,
+                    social_image_bytes=social_card_bytes,
+                    public_message_id=_pub_msg_id,
+                )
+            except Exception as e:
+                logger.error(f"_post_trade_review error ({account_info['name']}): {e}")
         asyncio.ensure_future(_post_trade_review())
 
     await log_channel.send_trade_confirmation(
@@ -745,30 +924,33 @@ async def _publish_roll(
     open_strategy: "StrategyInfo",
     open_metrics: "TradeMetrics",
 ) -> None:
-    discord_cfg = cfg.get("discord", {})
-    logo_url    = discord_cfg.get("logo_url", "")
-    webhook_url = account_info["discord_webhook"]
+    discord_cfg     = cfg.get("discord", {})
+    logo_url        = discord_cfg.get("logo_url", "")
+    public_webhook  = account_info.get("social_webhook", "")   # canal Público
+    private_webhook = account_info["discord_webhook"]           # canal Privado
 
-    ok = await send_roll(
-        webhook_url=webhook_url,
-        close_strategy=close_strategy,
-        close_metrics=close_metrics,
-        open_strategy=open_strategy,
-        open_metrics=open_metrics,
-        account_name=account_info["name"],
-        logo_url=logo_url,
-    )
-    if ok:
-        logger.info(f"  → Roll publicado en Discord ({account_info['name']})")
-    else:
-        await log_channel.send_error(
-            f"No se pudo publicar roll en Discord: {open_strategy.underlying} "
-            f"| {account_info['name']}"
+    # ── 1. Publicar roll en canal PÚBLICO sin botones ─────────
+    from . import card_generator as _cg_roll
+    public_msg_id: str = ""
+    if public_webhook:
+        roll_card_bytes = _cg_roll.generate_roll(
+            close_strategy, close_metrics, open_strategy, open_metrics,
+            logo_url, account_info["name"]
         )
+        if roll_card_bytes:
+            public_msg_id = await _post_image_raw(
+                public_webhook, roll_card_bytes, TradeEvent.ROLL
+            ) or ""
+        if public_msg_id:
+            logger.info(f"  → Roll publicado en canal publico ({account_info['name']}) msg={public_msg_id}")
+        else:
+            await log_channel.send_error(
+                f"No se pudo publicar roll en canal publico: {open_strategy.underlying} "
+                f"| {account_info['name']}"
+            )
 
-    # ── Revisión con botones → social_webhook ────────────────
-    social_wh = account_info.get("social_webhook", "")
-    if social_wh and approver:
+    # ── 2. Publicar en canal PRIVADO con botones de revisión ──
+    if approver:
         from .discord import _build_apertura_embed, _build_cierre_embed
         close_embed = _build_cierre_embed(close_strategy, close_metrics, TradeEvent.CLOSE, logo_url, account_info["name"])
         open_embed  = _build_apertura_embed(open_strategy, open_metrics, TradeEvent.OPEN, logo_url, account_info["name"])
@@ -778,20 +960,46 @@ async def _publish_roll(
             f"🔄 **ROLL  {open_strategy.underlying}**  ·  "
             f"{account_info['name']}  —  lista para publicar"
         )
-        from . import card_generator as _cg_roll
-        social_roll_bytes = _cg_roll.generate(
-            open_strategy, open_metrics, TradeEvent.OPEN, logo_url, account_info["name"], with_qr=True
+        # Discord usa embed nativo
+        # Twitter/X: tarjeta roll oscura con QR  →  roll_discord_bytes  →  _pending_card_images
+        # Instagram/Facebook: tarjeta roll clara con QR  →  social_roll_bytes  →  _pending_images
+        roll_discord_bytes = _cg_roll.generate_roll(
+            close_strategy, close_metrics, open_strategy, open_metrics,
+            logo_url, account_info["name"], with_qr=True
         )
+        social_roll_bytes  = None   # roll light aún no implementado — usar dark también
+        _pub_msg_id  = public_msg_id
+        _pub_webhook = public_webhook
+
         async def _post_roll_review() -> None:
-            target_ch = await approver._fetch_channel_id(account_info["discord_webhook"])
-            await approver.post_for_review(
-                embeds=[close_embed, open_embed],
-                report_type="operacion",
-                publish_webhook=social_wh,
-                header=header,
-                target_channel_id=target_ch,
-                social_image_bytes=social_roll_bytes,
-            )
+            try:
+                target_ch = _private_channel_ids.get(private_webhook)
+                if target_ch is None:
+                    target_ch = await approver._fetch_channel_id(private_webhook)
+                    if target_ch:
+                        _private_channel_ids[private_webhook] = target_ch
+                    else:
+                        logger.error(
+                            f"No se pudo resolver channel_id para canal privado de "
+                            f"{account_info['name']} — el mensaje de revisión del roll NO se publicará."
+                        )
+                        await log_channel.send_error(
+                            f"❌ Canal privado {account_info['name']}: channel_id no resuelto (roll). "
+                            "Revisa permisos del bot en el canal Automatización."
+                        )
+                        return
+                await approver.post_for_review(
+                    embeds=[close_embed, open_embed],
+                    report_type="operacion",
+                    publish_webhook=_pub_webhook,
+                    header=header,
+                    target_channel_id=target_ch,
+                    card_image_bytes=roll_discord_bytes,
+                    social_image_bytes=social_roll_bytes,
+                    public_message_id=_pub_msg_id,
+                )
+            except Exception as e:
+                logger.error(f"_post_roll_review error ({account_info['name']}): {e}")
         asyncio.ensure_future(_post_roll_review())
 
     await log_channel.send_trade_confirmation(
@@ -920,6 +1128,7 @@ async def main_async() -> None:
     account_map = cfg_module.account_map(cfg)
     setup_logging(cfg.get("logging", {}))
     _load_open_premiums()
+    _load_seen_exec_ids()
 
     logger.info("=" * 50)
     logger.info("MTO IB → Discord  |  Iniciando sistema")
@@ -1007,6 +1216,14 @@ async def main_async() -> None:
         daily_reporter.logbook_updater        = logbook
         daily_reporter.logbook_export_webhook = discord_cfg.get("logbook_export_webhook", "")
 
+        # ── Flex Logbook Exporter (reemplaza el export semanal del logbook) ─
+        flex_logbook = _build_flex_logbook(cfg, log_channel)
+        if flex_logbook:
+            daily_reporter.flex_logbook_exporter = flex_logbook
+            logger.info("FlexLogbookExporter: activo — export semanal desde IB Flex Query")
+        else:
+            logger.info("FlexLogbookExporter: no configurado (añadir ib_flex en config.yaml)")
+
         # ── Redes sociales ───────────────────────────────────────
         fb = _build_facebook(cfg)
         if fb:
@@ -1037,7 +1254,7 @@ async def main_async() -> None:
         await weekly_analyst.start()
 
     # ── Discord Approver (revisión de informes con botones) ──────
-    if cfg.get("discord", {}).get("bot_token") and cfg.get("discord", {}).get("review_webhook"):
+    if cfg.get("discord", {}).get("bot_token"):
         approver = DiscordApprover(
             cfg=cfg,
             facebook_poster=facebook_poster,
@@ -1050,11 +1267,33 @@ async def main_async() -> None:
             daily_reporter.approver = approver
         if weekly_analyst:
             weekly_analyst.approver = approver
+        # Pasar log_channel al approver para que ErrorFixer lo use al inicializarse
+        approver._log_channel_ref = log_channel
+
+        # ── MentionResponder (@Mto_Toni) ─────────────────────────
+        toni_id_str = cfg.get("discord", {}).get("toni_user_id", "")
+        if toni_id_str and cfg.get("discord", {}).get("mention_webhook"):
+            try:
+                mention_responder = MentionResponder(cfg, int(toni_id_str))
+                approver._mention_responder = mention_responder
+                logger.info(f"MentionResponder: activo para user_id={toni_id_str}")
+            except Exception as e:
+                logger.warning(f"MentionResponder: no se pudo inicializar: {e}")
 
     # ── Stripe onboarding ────────────────────────────────────────
     if cfg.get("stripe", {}).get("api_key"):
         stripe_onboarding = StripeOnboarding(cfg=cfg, log_channel=log_channel)
         await stripe_onboarding.start()
+
+    # ── Comerciales reporter (día 1 de cada mes, 09:15 Madrid) ───
+    comerciales_reporter = _build_comerciales(cfg)
+    if comerciales_reporter:
+        await comerciales_reporter.start()
+
+    # ── Coupon tracker (día 1 de cada mes, 09:20 Madrid) ─────────
+    coupon_tracker = _build_coupon_tracker(cfg)
+    if coupon_tracker:
+        await coupon_tracker.start()
 
     # ── Health reporter (email diario 09:00 Madrid) ──────────────
     health_reporter = HealthReporter(

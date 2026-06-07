@@ -65,7 +65,8 @@ class DailyReporter:
         self.weekly_webhook          = ""     # asignado desde main.py
         self.portfolio_tracker       = None   # asignado desde main.py
         self.portfolio_webhook       = ""     # asignado desde main.py
-        self.logbook_updater         = None   # asignado desde main.py
+        self.logbook_updater         = None   # asignado desde main.py (legacy)
+        self.flex_logbook_exporter   = None   # asignado desde main.py (nuevo — IB Flex Query)
         self.logbook_export_webhook  = ""     # asignado desde main.py
         self.facebook_poster         = None   # asignado desde main.py
         self.instagram_poster        = None   # asignado desde main.py
@@ -129,8 +130,28 @@ class DailyReporter:
 
     # ── Registro de operaciones del día ───────────────────────
 
+    # Estrategias que por definición son APERTURAS cuando reciben crédito neto.
+    # Si una pata cierra una posición previa del mismo subyacente (ej: long PUT
+    # de un PCS anterior), determine_trade_event devuelve CLOSE para esa pata.
+    # Pero el SPREAD en su conjunto es una apertura → forzamos OPEN.
+    _CREDIT_OPENING_NAMES = {
+        "PCS", "CCS", "CS", "BWB", "IC", "Iron Condor",
+        "CC", "CSP", "SP",  # Covered Call, Cash Secured Put, Short Put
+    }
+
     def record_trade(self, event_type: str, strategy, metrics, account_name: str) -> None:
         prem      = metrics.net_premium_after_comm or 0.0
+
+        # Corrección: spread de crédito neto → siempre es APERTURA
+        if (event_type in (TradeEvent.CLOSE, TradeEvent.PARTIAL_CLOSE)
+                and strategy.short_name in self._CREDIT_OPENING_NAMES
+                and prem > 0):
+            logger.info(
+                f"Daily reporter: {strategy.short_name} {strategy.underlying} "
+                f"reclasificado CLOSE→OPEN (crédito neto={prem:+.2f}, spread de apertura)"
+            )
+            event_type = TradeEvent.OPEN
+
         ev_simple = "open" if event_type in (TradeEvent.OPEN, TradeEvent.ADD) else "close"
         key       = (strategy.underlying, account_name, ev_simple)
 
@@ -282,12 +303,20 @@ class DailyReporter:
                     f"Logbook export: próximo envío el {fire_dt.strftime('%d/%m/%Y %H:%M')} Madrid"
                 )
                 await _sleep_until(fire_dt)
-                if self.logbook_updater and self.logbook_export_webhook:
+                if self.flex_logbook_exporter and self.logbook_export_webhook:
+                    # Nuevo: genera el Excel directamente desde IB Flex Query
+                    await self.flex_logbook_exporter.export_and_publish(
+                        self.logbook_export_webhook
+                    )
+                    await self._post_to_social("post_logbook_export", None,
+                        "📋 Log de operaciones semanal actualizado — MTO Opciones #opciones #trading")
+                elif self.logbook_updater and self.logbook_export_webhook:
+                    # Fallback legacy: export incremental desde el Excel en Dropbox
                     await self.logbook_updater.export_and_publish(self.logbook_export_webhook)
                     await self._post_to_social("post_logbook_export", None,
                         "📋 Log de operaciones semanal actualizado — MTO Opciones #opciones #trading")
                 else:
-                    logger.warning("Logbook export: logbook_updater o webhook no configurados")
+                    logger.warning("Logbook export: ni flex_logbook_exporter ni logbook_updater configurados")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -335,10 +364,30 @@ class DailyReporter:
 
             narrative = _build_premarket_narrative(futures, vix, macro_evs, headlines, today)
 
+            # Bloque de futuros tabulado (igual que el bloque Mercados del cierre)
+            fut_lines = []
+            fut_display = [
+                ("S&P 500", futures.get("S&P 500", {})),
+                ("Nasdaq",  futures.get("Nasdaq 100", {})),
+            ]
+            for name, d in fut_display:
+                if d and d.get("price"):
+                    arrow = "▲" if d["chg_pct"] >= 0 else "▼"
+                    sign  = "+" if d["chg_pct"] >= 0 else ""
+                    fut_lines.append(
+                        f"`{name:<8}` {d['price']:>10,.2f}   {arrow} `{sign}{d['chg_pct']:.2f}%`"
+                    )
+            if vix:
+                fut_lines.append(f"`VIX     ` {vix:>10.2f}")
+            fut_text = "\n".join(fut_lines) or "_Sin datos de futuros_"
+
             embed = {
                 "author":      {"name": f"📰  RESUMEN PRE-MERCADO  —  {fecha}"},
                 "description": narrative,
                 "color":       0xF39C12,
+                "fields": [
+                    {"name": "📊  Futuros", "value": fut_text, "inline": False},
+                ],
                 "footer":      {"text": "Apertura NYSE en ~20 min  ·  09:30 ET"},
             }
             target = self.premarket_webhook or self.webhook_url
