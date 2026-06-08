@@ -23,6 +23,7 @@ class IBConnector:
         self._reconnect_task: Optional[asyncio.Task] = None
 
         self.ib.disconnectedEvent += self._handle_disconnect
+        self._keepalive_task: Optional[asyncio.Task] = None
 
     @property
     def connected(self) -> bool:
@@ -36,6 +37,8 @@ class IBConnector:
         self._running = False
         if self._reconnect_task:
             self._reconnect_task.cancel()
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         if self.ib.isConnected():
             self.ib.disconnect()
 
@@ -49,6 +52,7 @@ class IBConnector:
                                            clientId=self.client_id, timeout=20)
                 logger.info("Conexión establecida con IB Gateway")
                 await self.on_connected(self.ib)
+                self._keepalive_task = asyncio.ensure_future(self._keepalive())
                 return
             except Exception as e:
                 attempt += 1
@@ -64,9 +68,25 @@ class IBConnector:
         self._reconnect_task = asyncio.ensure_future(self._reconnect())
 
     async def _reconnect(self) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
         await self.on_disconnected("Desconexión inesperada")
         await asyncio.sleep(self.reconnect_interval)
         await self._connect()
+
+    async def _keepalive(self) -> None:
+        """Envía un ping cada 3 minutos para evitar desconexiones por inactividad."""
+        try:
+            while self._running and self.ib.isConnected():
+                await asyncio.sleep(180)
+                if self.ib.isConnected():
+                    self.ib.reqCurrentTime()
+                    logger.debug("Keep-alive IB Gateway enviado")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Keep-alive error: {e}")
 
     async def get_contract_details(self, contract: Contract) -> Optional[str]:
         """Devuelve el nombre de la empresa del contrato, si está disponible."""

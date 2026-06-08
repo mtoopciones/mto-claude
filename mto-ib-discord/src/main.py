@@ -194,7 +194,10 @@ async def on_disconnected(reason: str) -> None:
         except Exception:
             pass
     ib_ref = None
-    await log_channel.send_disconnected(reason)
+    if log_channel is not None:
+        await log_channel.send_disconnected(reason)
+    else:
+        logger.warning(f"Desconectado de IB Gateway (log_channel no disponible): {reason}")
 
 
 # ─────────────────────────────────────────────────────────────
