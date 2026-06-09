@@ -462,6 +462,8 @@ class DiscordApprover:
             or self.review_webhook
         )
 
+        self._mention_responder = None   # asignado desde main.py tras init
+
         intents = discord.Intents.default()
         intents.message_content = True   # privileged intent — activar en Discord Dev Portal
         self.client = discord.Client(intents=intents)
@@ -594,6 +596,19 @@ class DiscordApprover:
     async def _on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
+
+        # ── Bloque 6: Menciones a Toni / Mario ───────────────────────
+        if self._mention_responder and message.mentions:
+            mention_ids = {u.id for u in message.mentions}
+            tracked = set()
+            if self._mention_responder.toni_user_id:
+                tracked.add(self._mention_responder.toni_user_id)
+            if self._mention_responder.mario_user_id:
+                tracked.add(self._mention_responder.mario_user_id)
+            if mention_ids & tracked:
+                await self._mention_responder.handle_mention(message, self.client)
+
+        # ── Bloque 4: YouTube ─────────────────────────────────────────
         if self.youtube_channel_id and message.channel.id != self.youtube_channel_id:
             return
         if not self.youtube_channel_id:

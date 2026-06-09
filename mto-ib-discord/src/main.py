@@ -39,6 +39,7 @@ from .twitter_poster import build_from_config as _build_twitter
 from .health_reporter import HealthReporter
 from .discord_approver import DiscordApprover
 from .flex_logbook_exporter import build_from_config as _build_flex_logbook
+from . import newsletter_processor as _newsletter
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1273,15 +1274,25 @@ async def main_async() -> None:
         # Pasar log_channel al approver para que ErrorFixer lo use al inicializarse
         approver._log_channel_ref = log_channel
 
-        # ── MentionResponder (@Mto_Toni) ─────────────────────────
-        toni_id_str = cfg.get("discord", {}).get("toni_user_id", "")
-        if toni_id_str and cfg.get("discord", {}).get("mention_webhook"):
+        # ── Bloque 6: MentionResponder (@Mto_Toni / @Mto_Mario) ──────
+        toni_id_str  = cfg.get("discord", {}).get("toni_user_id",  "")
+        mario_id_str = cfg.get("discord", {}).get("mario_user_id", "")
+        _disc        = cfg.get("discord", {})
+        _has_webhook = (
+            _disc.get("toni_mention_webhook")
+            or _disc.get("mario_mention_webhook")
+            or _disc.get("mention_webhook")
+        )
+        if (toni_id_str or mario_id_str) and _has_webhook:
             try:
-                mention_responder = MentionResponder(cfg, int(toni_id_str))
+                mention_responder = MentionResponder(cfg, int(toni_id_str) if toni_id_str else 0)
                 approver._mention_responder = mention_responder
-                logger.info(f"MentionResponder: activo para user_id={toni_id_str}")
+                logger.info(
+                    f"Bloque 6 Menciones: activo "
+                    f"(Toni={toni_id_str or '—'}, Mario={mario_id_str or '—'})"
+                )
             except Exception as e:
-                logger.warning(f"MentionResponder: no se pudo inicializar: {e}")
+                logger.warning(f"Bloque 6 Menciones: no se pudo inicializar: {e}")
 
     # ── Stripe onboarding ────────────────────────────────────────
     if cfg.get("stripe", {}).get("api_key"):
@@ -1297,6 +1308,37 @@ async def main_async() -> None:
     coupon_tracker = _build_coupon_tracker(cfg)
     if coupon_tracker:
         await coupon_tracker.start()
+
+    # ── Bloque 5 — Newsletter → Redes Sociales ───────────────────
+    nl_cfg = cfg.get("newsletter", {})
+    nl_api_key     = nl_cfg.get("mailerlite_api_key", "").strip()
+    nl_secret      = nl_cfg.get("mailerlite_webhook_secret", "").strip()
+    nl_channel_id  = nl_cfg.get("discord_channel_id", "").strip()
+    nl_pub_webhook = nl_cfg.get("discord_publish_webhook", "").strip()
+    nl_port        = int(nl_cfg.get("webhook_port", 8765))
+    anthropic_key  = cfg.get("anthropic", {}).get("api_key", "")
+
+    if nl_api_key and nl_channel_id and approver:
+        from aiohttp import web as _aio_web
+
+        _nl_handler = _newsletter.create_webhook_handler(
+            api_key         = nl_api_key,
+            webhook_secret  = nl_secret,
+            anthropic_key   = anthropic_key,
+            approver        = approver,
+            publish_webhook = nl_pub_webhook,
+            channel_id      = nl_channel_id,
+        )
+
+        _nl_app = _aio_web.Application()
+        _nl_app.router.add_post("/webhook/newsletter", _nl_handler)
+        _nl_runner = _aio_web.AppRunner(_nl_app)
+        await _nl_runner.setup()
+        _nl_site = _aio_web.TCPSite(_nl_runner, "0.0.0.0", nl_port)
+        await _nl_site.start()
+        logger.info(f"Bloque 5 Newsletter: escuchando en 0.0.0.0:{nl_port}/webhook/newsletter")
+    else:
+        logger.info("Bloque 5 Newsletter: desactivado (falta mailerlite_api_key, discord_channel_id o approver)")
 
     # ── Health reporter (email diario 09:00 Madrid) ──────────────
     health_reporter = HealthReporter(
