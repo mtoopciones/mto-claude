@@ -1,0 +1,8 @@
+ib_insync==0.9.86
+aiohttp==3.9.5
+pyyaml==6.0.1
+loguru==0.7.2
+Pillow>=10.0.0
+openpyxl>=3.1.0
+tweepy>=4.14.0
+stripe>=8.0.0
